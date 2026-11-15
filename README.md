@@ -32,3 +32,7 @@
 
 ```bash
 Disasm.exe -f <input_exe> -c <output_c_file>
+
+![C++](https://img.shields.io/badge/C%2B%2B-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
