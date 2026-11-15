@@ -1,3 +1,7 @@
+![C++](https://img.shields.io/badge/C%2B%2B-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
+
 # Disasm - 纯 C++ 实现的轻量级反编译引擎
 
 **Disasm** 是一个从零开始、纯 C++ 编写的轻量级静态反编译工具。它能够解析 Windows PE 文件，提取代码段，并将底层机器码翻译成可编译的高级 C 语言代码。
@@ -32,7 +36,3 @@
 
 ```bash
 Disasm.exe -f <input_exe> -c <output_c_file>
-
-![C++](https://img.shields.io/badge/C%2B%2B-00599C?style=for-the-badge&logo=c%2B%2B&logoColor=white)
-![Windows](https://img.shields.io/badge/Windows-0078D6?style=for-the-badge&logo=windows&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
