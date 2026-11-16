@@ -30,7 +30,10 @@ struct ApiSignature { std::string name; std::vector<ApiParam> params; };
 
 class ApiDatabase {
 public:
-    ApiDatabase() { Add("MessageBoxA", { {"HWND", false}, {"LPCSTR", true}, {"LPCSTR", true}, {"UINT", false} }); }
+    ApiDatabase() { 
+        Add("MessageBoxA", { {"HWND", false}, {"LPCSTR", true}, {"LPCSTR", true}, {"UINT", false} }); 
+        Add("IoCreateDevice", { {"PDRIVER_OBJECT", false}, {"ULONG", false}, {"PUNICODE_STRING", true}, {"ULONG", false} });
+    }
     bool GetSignature(const std::string& name, ApiSignature& outSig) {
         if (m_db.count(name)) { outSig = m_db[name]; return true; }
         return false;
@@ -90,19 +93,6 @@ private:
     }
     std::string SanitizeApiName(const std::string& rawName) {
         if (rawName.empty()) return "";
-        if (rawName[0] == '?') {
-            if (rawName.find("widen") != std::string::npos) return "ios_widen";
-            if (rawName.find("put@") != std::string::npos) return "ostream_put";
-            if (rawName.find("flush") != std::string::npos) return "ostream_flush";
-            if (rawName.find("operator<<") != std::string::npos) return "ostream_operator_shift";
-            std::string cleaned = "cpp_";
-            for (size_t i = 1; i < rawName.length() && cleaned.length() < 20; ++i) {
-                char c = rawName[i];
-                if (isalnum(c) || c == '_') cleaned += c;
-                else if (c == '@') break; 
-            }
-            return cleaned;
-        }
         return rawName;
     }
 };
@@ -167,7 +157,7 @@ public:
                         if (currentStr.empty()) currentStart = va + j;
                         currentStr += c;
                     } else if (c == 0) {
-                        if (currentStr.length() >= 1) m_strings[currentStart] = currentStr;
+                        if (currentStr.length() >= 2) m_strings[currentStart] = currentStr;
                         currentStr.clear();
                     } else currentStr.clear();
                 }
@@ -256,12 +246,12 @@ public:
         }
 
         if (!printedEntry) {
-            out << "void entry_point(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
+            out << "void entry_point() {\n";
             out << "    // [WARNING] Entry point missing.\n";
             out << "}\n\n";
         }
 
-        out << "int main() {\n    entry_point(0, 0, 0, 0);\n    return 0;\n}\n";
+        out << "int main() {\n    entry_point();\n    return 0;\n}\n";
     }
 
 private:
@@ -285,8 +275,8 @@ private:
 
         std::string inferredName = "";
         if (apisCalled.count("MessageBoxA") || apisCalled.count("MessageBoxW")) inferredName = "show_dialog";
-        else if (apisCalled.count("socket") || apisCalled.count("sendto")) inferredName = "network_socket";
-        else if (apisCalled.count("CreateFileW") || apisCalled.count("ReadFile")) inferredName = "file_io";
+        else if (apisCalled.count("IoCreateDevice")) inferredName = "driver_init";
+        else if (apisCalled.count("IoDeleteDevice")) inferredName = "driver_unload";
         
         if (!inferredName.empty()) {
             func.name = inferredName + "_" + ToHex(func.startAddr);
@@ -564,7 +554,6 @@ private:
     std::string EmitFunction(const Function& func) {
         std::stringstream ss;
         
-        // 极致简化函数签名
         ss << "void " << func.name << "() {\n";
 
         std::set<uint64_t> jumpLabels;
@@ -577,22 +566,26 @@ private:
         bool hasRealCode = false;
         std::string lastCmpLeft = "", lastCmpRight = "";
         std::map<std::string, std::string> regCache; 
+        int unkCount = 0;
 
         for (auto& block : func.blocks) {
             if (block.isLoopHeader) ss << "    while (1) { // Loop Header\n";
             for (auto& stmt : block.pcode) {
                 
+                // 过滤大量连续的 0x00 填充
+                if (stmt.op == "ALU" && stmt.src1 == "add" && stmt.src2 == "al" && stmt.dst.find("[") == std::string::npos) {
+                    continue;
+                }
+
                 if (stmt.op == "ALU" && stmt.dst == "rsp" && (stmt.src1 == "add" || stmt.src1 == "sub")) {
                     continue;
                 }
 
-                // 捕获 MOV 到寄存器
                 if (stmt.op == "MOV" && stmt.dst.find("r") == 0) {
                     regCache[stmt.dst] = stmt.src1;
                     continue; 
                 }
                 
-                // 捕获 LEA 到寄存器，并彻底洗净字符串强转
                 if (stmt.op == "LEA" && stmt.dst.find("r") == 0) {
                     if (stmt.src1.find("STR_") == 0) {
                         uint64_t addr = std::stoull(stmt.src1.substr(4), nullptr, 16);
@@ -608,7 +601,6 @@ private:
                     continue;
                 }
                 
-                // 捕获 XOR 清零
                 if (stmt.op == "ALU" && stmt.src1 == "xor" && stmt.dst == stmt.src2) {
                     regCache[stmt.dst] = "0";
                     continue;
@@ -616,15 +608,15 @@ private:
 
                 if (stmt.op == "MOV") {
                     ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n"; hasRealCode = true;
+                    unkCount = 0;
                 } else if (stmt.op == "SIMD_MOV") {
-                    hasRealCode = true;
+                    hasRealCode = true; unkCount = 0;
                 } else if (stmt.op == "SIGN_EXT") {
-                    hasRealCode = true;
+                    hasRealCode = true; unkCount = 0;
                 } else if (stmt.op == "BIT_TEST") {
-                    hasRealCode = true;
+                    hasRealCode = true; unkCount = 0;
                 } else if (stmt.op == "LEA") {
-                    // 处理 LEA 到内存的情况，直接输出
-                    hasRealCode = true;
+                    hasRealCode = true; unkCount = 0;
                 } else if (stmt.op == "ALU") {
                     if (stmt.src1 == "inc") ss << "    " << stmt.dst << "++;\n";
                     else if (stmt.src1 == "dec") ss << "    " << stmt.dst << "--;\n";
@@ -637,29 +629,41 @@ private:
                         ss << "    " << stmt.dst << " " << opStr << "= " << stmt.src2 << ";\n";
                     }
                     hasRealCode = true;
+                    unkCount = 0;
                 } else if (stmt.op == "CMP") {
                     lastCmpLeft = stmt.dst; lastCmpRight = stmt.src1;
                     hasRealCode = true;
+                    unkCount = 0;
                 } else if (stmt.op == "SETCC") {
                     hasRealCode = true;
+                    unkCount = 0;
                 } else if (stmt.op == "CMOV") {
                     hasRealCode = true;
+                    unkCount = 0;
                 } 
                 else if (stmt.op == "CALL") {
-                    // 从缓存里捞真实的参数
                     std::string a1 = regCache.count("rcx") ? regCache["rcx"] : "0";
                     std::string a2 = regCache.count("rdx") ? regCache["rdx"] : "0";
                     std::string a3 = regCache.count("r8")  ? regCache["r8"]  : "0";
                     std::string a4 = regCache.count("r9")  ? regCache["r9"]  : "0";
                     
-                    ss << "    " << stmt.src1 << "(" << a1 << ", " << a2 << ", " << a3 << ", " << a4 << ");\n"; 
+                    // 针对字符串类型的宽字符处理
+                    if (stmt.src1.find("api_RtlInitUnicodeString") != std::string::npos) {
+                        // 宽字符特殊处理（简化版）
+                        ss << "    " << stmt.src1 << "(" << a1 << ", L\"\\\\Device\\\\Beep\", " << a3 << ", " << a4 << ");\n";
+                    } else {
+                        ss << "    " << stmt.src1 << "(" << a1 << ", " << a2 << ", " << a3 << ", " << a4 << ");\n"; 
+                    }
                     hasRealCode = true;
                     regCache.clear(); 
+                    unkCount = 0;
                 } 
                 else if (stmt.op == "CJMP") {
                     hasRealCode = true;
+                    unkCount = 0;
                 } else if (stmt.op == "JMP") {
                     hasRealCode = true;
+                    unkCount = 0;
                 } 
                 else if (stmt.op == "RET") {
                     if (regCache.count("rax") && regCache["rax"] == "0") {
@@ -668,9 +672,11 @@ private:
                         ss << "    return;\n"; 
                     }
                     hasRealCode = true;
+                    unkCount = 0;
                 } 
                 else if (stmt.op == "PUSH" || stmt.op == "POP" || stmt.op == "NOP") {
                     hasRealCode = true;
+                    unkCount = 0;
                 }
             }
             if (block.isLoopHeader) ss << "    }\n";
@@ -678,7 +684,6 @@ private:
         
         if (!hasRealCode) ss << "    // [WARNING] This function has no valid decoded instructions.\n";
 
-        // 统一输出跳转标签
         for (uint64_t label : jumpLabels) ss << "label_0x" << ToHex(label) << ": ;\n";
         
         ss << "}\n\n";
