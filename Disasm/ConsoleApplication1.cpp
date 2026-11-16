@@ -123,11 +123,13 @@ struct Function {
     std::string name;
     std::vector<BasicBlock> blocks;
     bool isDead = true;
+    bool isLibraryFunc = false; // 【新增】FLIRT 识别标记
+    std::string libFuncName;    // 【新增】识别的库函数名称
     std::string generatedCode;
 };
 
 // =========================================================
-// 终极反编译引擎 (全面净化版)
+// 终极反编译引擎 (FLIRT 识别 + P-Code)
 // =========================================================
 class UltimateDecompiler {
 public:
@@ -172,6 +174,15 @@ public:
                     if (idx >= m_functions.size()) break;
                     Function& func = m_functions[idx];
                     if (func.isDead) continue;
+                    
+                    // 【核心步骤】FLIRT 库函数特征识别
+                    IdentifyLibraryCode(func);
+                    
+                    // 如果是库函数，直接跳过复杂的反编译逻辑，节省算力
+                    if (func.isLibraryFunc) {
+                        func.generatedCode = EmitLibraryStub(func);
+                        continue;
+                    }
                     
                     BuildCFG(func);
                     BuildDominatorTree(func);
@@ -223,6 +234,53 @@ private:
     std::unordered_map<uint64_t, std::string> m_strings;
     std::set<uint64_t> m_calledFuncs;
 
+    // 【新增】FLIRT 智能特征识别
+    void IdentifyLibraryCode(Function& func) {
+        bool hasSecurityCookie = false;
+        bool hasRtlCapture = false;
+        bool hasTimeCheck = false;
+        bool hasRtlUnwind = false;
+        bool hasCxxException = false;
+
+        for (auto& block : func.blocks) {
+            for (auto& stmt : block.pcode) {
+                if (stmt.op == "CALL") {
+                    if (stmt.src1.find("api_GetSystemTimeAsFileTime") != std::string::npos) hasTimeCheck = true;
+                    if (stmt.src1.find("api_QueryPerformanceCounter") != std::string::npos) hasTimeCheck = true;
+                    if (stmt.src1.find("api_RtlCaptureContext") != std::string::npos) hasRtlCapture = true;
+                    if (stmt.src1.find("api_RtlUnwindEx") != std::string::npos) hasRtlUnwind = true;
+                    if (stmt.src1.find("api_RaiseException") != std::string::npos) hasCxxException = true;
+                }
+                // 检测栈保护魔数 0x2b992ddfa232
+                if (stmt.src1.find("0x2b992ddfa232") != std::string::npos) hasSecurityCookie = true;
+            }
+        }
+
+        if (hasSecurityCookie && hasTimeCheck) {
+            func.isLibraryFunc = true;
+            func.libFuncName = "__security_init_cookie";
+        } else if (hasRtlCapture || hasRtlUnwind) {
+            func.isLibraryFunc = true;
+            func.libFuncName = "__SEH_Exception_Handler";
+        } else if (hasCxxException) {
+            func.isLibraryFunc = true;
+            func.libFuncName = "__CxxThrowException";
+        } else if (func.blocks.size() == 1 && func.blocks[0].pcode.size() <= 2) {
+            // 过滤极其短小的库跳板代码
+            func.isLibraryFunc = true;
+            func.libFuncName = "CRT_Stub";
+        }
+    }
+
+    // 生成折叠后的库函数占位符
+    std::string EmitLibraryStub(const Function& func) {
+        std::stringstream ss;
+        ss << "void " << func.name << "(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
+        ss << "    // [FLIRT] Identified as: " << func.libFuncName << "\n";
+        ss << "}\n\n";
+        return ss.str();
+    }
+
     std::string GetRegName(ZydisRegister reg) {
         const char* name = ZydisRegisterGetString(reg);
         if (!name) return "unknown";
@@ -259,10 +317,7 @@ private:
                 Insn& insn = allInstructions[i];
                 std::string m = ZydisMnemonicGetString(insn.instr.mnemonic);
                 
-                // 如果是纯垃圾指令，直接跳过不处理
-                if (m == "int3" || m == "nop" || m == "endbr64" || m == "invalid") {
-                    i++; continue;
-                }
+                if (m == "int3" || m == "nop" || m == "endbr64" || m == "invalid") { i++; continue; }
 
                 if (m == "call" || m == "add" || m == "sub" || m == "xor" || m.rfind("j", 0) == 0 || m == "ret") func.isDead = false;
                 
@@ -271,7 +326,6 @@ private:
                 stmt.op = "UNK";
                 stmt.dst = ""; stmt.src1 = ""; stmt.src2 = ""; stmt.jumpTarget = 0;
 
-                // 获取操作数字符串的辅助 lambda
                 auto GetOpStr = [&](int idx) -> std::string {
                     if (idx >= insn.instr.operand_count) return "";
                     auto& op = insn.operands[idx];
@@ -288,67 +342,45 @@ private:
                 };
 
                 if (m == "mov" || m == "movzx" || m == "movsxd" || m == "movsx") {
-                    stmt.op = "MOV";
-                    stmt.dst = GetOpStr(0);
-                    stmt.src1 = GetOpStr(1);
+                    stmt.op = "MOV"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1);
                 }
                 else if (m == "lea") {
-                    stmt.op = "LEA";
-                    stmt.dst = GetOpStr(0);
+                    stmt.op = "LEA"; stmt.dst = GetOpStr(0);
                     if (insn.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[1].mem.base == ZYDIS_REGISTER_RIP) {
                         uint64_t target = insn.addr + insn.instr.length + insn.operands[1].mem.disp.value;
                         stmt.src1 = "STR_" + ToHex(target);
-                    } else {
-                        stmt.src1 = GetOpStr(1);
-                    }
+                    } else stmt.src1 = GetOpStr(1);
                 }
                 else if (m == "add" || m == "sub" || m == "xor" || m == "and" || m == "or" || m == "shl" || m == "shr" || m == "sar") {
-                    stmt.op = "ALU";
-                    stmt.dst = GetOpStr(0);
-                    stmt.src1 = m; 
-                    stmt.src2 = GetOpStr(1);
+                    stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = GetOpStr(1);
                 }
                 else if (m == "inc" || m == "dec" || m == "neg" || m == "not") {
-                    stmt.op = "ALU";
-                    stmt.dst = GetOpStr(0);
-                    stmt.src1 = m;
-                    stmt.src2 = "1"; // 用于自增/自减占位
+                    stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = "1"; 
                 }
                 else if (m == "cmp" || m == "test") {
-                    stmt.op = "CMP";
-                    stmt.dst = GetOpStr(0);
-                    stmt.src1 = (m == "test") ? "0" : GetOpStr(1);
+                    stmt.op = "CMP"; stmt.dst = GetOpStr(0); stmt.src1 = (m == "test") ? "0" : GetOpStr(1);
                 }
                 else if (m == "call") {
                     stmt.op = "CALL";
-                    if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) stmt.src1 = "sub_" + ToHex(insn.operands[0].imm.value.u);
-                    else stmt.src1 = GetOpStr(0);
+                    if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        stmt.src1 = "sub_" + ToHex(insn.operands[0].imm.value.u);
+                    } 
+                    else if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[0].mem.base == ZYDIS_REGISTER_RIP) {
+                        uint64_t targetAddr = insn.addr + insn.instr.length + insn.operands[0].mem.disp.value;
+                        std::string apiName = m_apiResolver->GetApiName(targetAddr);
+                        if (!apiName.empty()) stmt.src1 = "api_" + apiName;
+                        else stmt.src1 = "((void(*)())MEM(0x" + ToHex(targetAddr) + "))";
+                    } else stmt.src1 = GetOpStr(0);
                 }
                 else if (m.rfind("j", 0) == 0) {
-                    stmt.op = (m == "jmp") ? "JMP" : "CJMP";
-                    stmt.src1 = m;
+                    stmt.op = (m == "jmp") ? "JMP" : "CJMP"; stmt.src1 = m;
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) stmt.jumpTarget = insn.operands[0].imm.value.u;
                 }
-                else if (m == "ret") {
-                    stmt.op = "RET";
-                }
-                else if (m == "push") {
-                    stmt.op = "PUSH";
-                    stmt.src1 = GetOpStr(0);
-                }
-                else if (m == "pop") {
-                    stmt.op = "POP";
-                    stmt.dst = GetOpStr(0);
-                }
+                else if (m == "ret") { stmt.op = "RET"; }
+                else if (m == "push") { stmt.op = "PUSH"; stmt.src1 = GetOpStr(0); }
+                else if (m == "pop") { stmt.op = "POP"; stmt.dst = GetOpStr(0); }
 
-                // 只有成功转换为 P-Code 的指令才会被加入
-                if (stmt.op != "UNK") {
-                    func.blocks.back().pcode.push_back(stmt);
-                } else {
-                    // 如果是还没支持的指令，为了不污染代码，这里也不输出 UNK 节点了
-                    // 如果你想看它们，可以在这里加个输出
-                }
-
+                if (stmt.op != "UNK") func.blocks.back().pcode.push_back(stmt);
                 i++;
                 if (m == "ret") break;
             }
@@ -359,13 +391,11 @@ private:
     void BuildCFG(Function& func) {
         std::set<uint64_t> leaders;
         if (!func.blocks.empty() && !func.blocks[0].pcode.empty()) leaders.insert(func.blocks[0].pcode[0].addr);
-        
         for (auto& block : func.blocks) {
             for (auto& stmt : block.pcode) {
                 if (stmt.op == "JMP" || stmt.op == "CJMP") leaders.insert(stmt.jumpTarget);
             }
         }
-        
         if (func.blocks.empty()) func.blocks.push_back({});
         func.blocks[0].id = 0;
         func.blocks[0].startAddr = func.startAddr;
@@ -376,7 +406,6 @@ private:
         int N = func.blocks.size();
         std::vector<int> rpo; std::vector<int> rpo_index(N, -1);
         for (int i = 0; i < N; ++i) { rpo.push_back(i); rpo_index[i] = i; }
-        
         func.blocks[0].idom = 0;
         bool changed = true;
         while (changed) {
@@ -423,7 +452,6 @@ private:
 
         for (auto& block : func.blocks) {
             if (block.isLoopHeader) ss << "    while (1) { // Loop Header\n";
-            
             for (auto& stmt : block.pcode) {
                 if (stmt.op == "MOV") {
                     ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n";
@@ -433,9 +461,7 @@ private:
                         auto it = m_strings.find(addr);
                         if (it != m_strings.end()) ss << "    " << stmt.dst << " = (uint64_t)\"" << it->second << "\";\n";
                         else ss << "    " << stmt.dst << " = (uint64_t)&MEM(" << ToHex(addr - m_imageBase) << ");\n";
-                    } else {
-                        ss << "    " << stmt.dst << " = (uint64_t)&" << stmt.src1 << ";\n";
-                    }
+                    } else ss << "    " << stmt.dst << " = (uint64_t)&" << stmt.src1 << ";\n";
                 } else if (stmt.op == "ALU") {
                     if (stmt.src1 == "inc") ss << "    " << stmt.dst << "++;\n";
                     else if (stmt.src1 == "dec") ss << "    " << stmt.dst << "--;\n";
@@ -450,10 +476,7 @@ private:
                 } else if (stmt.op == "CALL") {
                     ss << "    " << stmt.src1 << "(rcx, rdx, r8, r9);\n";
                 } else if (stmt.op == "CJMP") {
-                    std::string cond = "==";
-                    if (stmt.src1 == "jnz" || stmt.src1 == "jne") cond = "!=";
-                    else if (stmt.src1 == "jg") cond = ">";
-                    else if (stmt.src1 == "jl") cond = "<";
+                    std::string cond = (stmt.src1 == "jnz" || stmt.src1 == "jne") ? "!=" : (stmt.src1 == "jg") ? ">" : (stmt.src1 == "jl") ? "<" : "==";
                     ss << "    if (!(rax " << cond << " 0)) break;\n";
                 } else if (stmt.op == "RET") {
                     ss << "    return;\n";
@@ -534,7 +557,7 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "[+] Disassembled " << allInstructions.size() << " instructions.\n";
 
-    std::cout << "[*] Running P-Code Pipeline...\n";
+    std::cout << "[*] Running P-Code Pipeline & FLIRT Matching...\n";
     UltimateDecompiler decompiler(&apiResolver);
     decompiler.LoadStrings(fileData.data(), fileSize, ntHeader, imageBase);
     decompiler.AnalyzeAllFunctions(allInstructions, imageBase);
