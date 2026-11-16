@@ -30,9 +30,9 @@ struct ApiSignature { std::string name; std::vector<ApiParam> params; };
 
 class ApiDatabase {
 public:
-    ApiDatabase() { 
-        Add("MessageBoxA", { {"HWND", false}, {"LPCSTR", true}, {"LPCSTR", true}, {"UINT", false} }); 
-        Add("IoCreateDevice", { {"PDRIVER_OBJECT", false}, {"ULONG", false}, {"PUNICODE_STRING", true}, {"ULONG", false} });
+    ApiDatabase() {
+        Add("MessageBoxA", { { "HWND", false },{ "LPCSTR", true },{ "LPCSTR", true },{ "UINT", false } });
+        Add("IoCreateDevice", { { "PDRIVER_OBJECT", false },{ "ULONG", false },{ "PUNICODE_STRING", true },{ "ULONG", false } });
     }
     bool GetSignature(const std::string& name, ApiSignature& outSig) {
         if (m_db.count(name)) { outSig = m_db[name]; return true; }
@@ -49,7 +49,8 @@ public:
         uint32_t importRva = 0;
         if (ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
             importRva = reinterpret_cast<const IMAGE_NT_HEADERS32*>(ntHeader)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
-        } else {
+        }
+        else {
             importRva = reinterpret_cast<const IMAGE_NT_HEADERS64*>(ntHeader)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
         }
         if (importRva == 0) return;
@@ -107,12 +108,12 @@ struct Insn {
 };
 
 struct PCodeStmt {
-    std::string op;       
-    std::string dst;      
-    std::string src1;     
-    std::string src2;     
-    uint64_t jumpTarget;  
-    uint64_t addr;        
+    std::string op;
+    std::string dst;
+    std::string src1;
+    std::string src2;
+    uint64_t jumpTarget;
+    uint64_t addr;
 };
 
 struct BasicBlock {
@@ -156,10 +157,12 @@ public:
                     if (c >= 32 && c <= 126) {
                         if (currentStr.empty()) currentStart = va + j;
                         currentStr += c;
-                    } else if (c == 0) {
+                    }
+                    else if (c == 0) {
                         if (currentStr.length() >= 2) m_strings[currentStart] = currentStr;
                         currentStr.clear();
-                    } else currentStr.clear();
+                    }
+                    else currentStr.clear();
                 }
             }
         }
@@ -168,7 +171,7 @@ public:
     void AnalyzeAllFunctions(std::vector<Insn>& allInstructions, uint64_t imageBase, uint64_t peEntryPointVA) {
         m_imageBase = imageBase;
         FindFunctions(allInstructions, peEntryPointVA);
-        
+
         for (auto& func : m_functions) {
             if (!func.isDead) {
                 InferFunctionName(func);
@@ -187,19 +190,19 @@ public:
                     if (idx >= m_functions.size()) break;
                     Function& func = m_functions[idx];
                     if (func.isDead) continue;
-                    
+
                     IdentifyLibraryCode(func);
                     if (func.isLibraryFunc) {
                         func.generatedCode = EmitLibraryStub(func);
                         continue;
                     }
-                    
+
                     BuildCFG(func);
                     BuildDominatorTree(func);
                     FindLoops(func);
                     func.generatedCode = EmitFunction(func);
                 }
-            });
+                });
         }
         for (auto& th : threads) th.join();
     }
@@ -277,15 +280,15 @@ private:
         if (apisCalled.count("MessageBoxA") || apisCalled.count("MessageBoxW")) inferredName = "show_dialog";
         else if (apisCalled.count("IoCreateDevice")) inferredName = "driver_init";
         else if (apisCalled.count("IoDeleteDevice")) inferredName = "driver_unload";
-        
+
         if (!inferredName.empty()) {
             func.name = inferredName + "_" + ToHex(func.startAddr);
         }
     }
 
     void IdentifyLibraryCode(Function& func) {
-        if (func.name == "entry_point") return; 
-        
+        if (func.name == "entry_point") return;
+
         bool hasSecurityCookie = false;
         bool hasRtlCapture = false;
         bool hasTimeCheck = false;
@@ -304,7 +307,8 @@ private:
         if (hasSecurityCookie && hasTimeCheck) {
             func.isLibraryFunc = true;
             func.libFuncName = "__security_init_cookie";
-        } else if (hasRtlCapture) {
+        }
+        else if (hasRtlCapture) {
             func.isLibraryFunc = true;
             func.libFuncName = "__SEH_Exception_Handler";
         }
@@ -333,7 +337,7 @@ private:
         std::set<uint64_t> funcStarts;
         uint64_t actualEntryPointVA = peEntryPointVA;
         bool foundInText = false;
-        
+
         if (!allInstructions.empty()) {
             if (peEntryPointVA != 0) {
                 for (auto& insn : allInstructions) {
@@ -358,27 +362,37 @@ private:
         while (i < allInstructions.size()) {
             Function func;
             func.startAddr = allInstructions[i].addr;
-            
+
             if (func.startAddr == actualEntryPointVA && !assignedEntryPoint) {
                 func.name = "entry_point";
                 func.isDead = false;
                 assignedEntryPoint = true;
-            } else {
+            }
+            else {
                 func.name = "func_" + ToHex(func.startAddr);
                 func.isDead = true;
             }
-            
+
             func.blocks.push_back({});
 
             while (i < allInstructions.size()) {
                 if (i > 0 && funcStarts.count(allInstructions[i].addr) && allInstructions[i].addr != func.startAddr) break;
                 Insn& insn = allInstructions[i];
                 std::string m = ZydisMnemonicGetString(insn.instr.mnemonic);
-                
+
                 if (m == "int3" || m == "nop" || m == "endbr64" || m == "invalid") { i++; continue; }
 
+                // [FIX-1] 丢弃 0x00 填充：add byte ptr [reg], al（编码 0x00 0x00..0x07）
+                if (m == "add" && insn.instr.operand_count == 2 &&
+                    insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                    insn.operands[0].size == 8 &&
+                    insn.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    insn.operands[1].reg.value == ZYDIS_REGISTER_AL) {
+                    i++; continue;
+                }
+
                 if (m == "call" || m == "add" || m == "sub" || m == "xor" || m.rfind("j", 0) == 0 || m == "ret") func.isDead = false;
-                
+
                 PCodeStmt stmt;
                 stmt.addr = insn.addr;
                 stmt.op = "UNK";
@@ -397,7 +411,7 @@ private:
                         return res;
                     }
                     return "unknown";
-                };
+                    };
 
                 if (m == "mov" || m == "movzx" || m == "movsxd" || m == "movsx") {
                     stmt.op = "MOV"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1);
@@ -410,13 +424,14 @@ private:
                     if (insn.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[1].mem.base == ZYDIS_REGISTER_RIP) {
                         uint64_t target = insn.addr + insn.instr.length + insn.operands[1].mem.disp.value;
                         stmt.src1 = "STR_" + ToHex(target);
-                    } else stmt.src1 = GetOpStr(1);
+                    }
+                    else stmt.src1 = GetOpStr(1);
                 }
                 else if (m == "add" || m == "sub" || m == "xor" || m == "and" || m == "or" || m == "shl" || m == "shr" || m == "sar" || m == "pxor" || m == "pand" || m == "por") {
                     stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = GetOpStr(1);
                 }
                 else if (m == "inc" || m == "dec" || m == "neg" || m == "not") {
-                    stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = "1"; 
+                    stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = "1";
                 }
                 else if (m == "bt" || m == "bts" || m == "btr" || m == "btc") {
                     stmt.op = "BIT_TEST"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1); stmt.src2 = m;
@@ -448,27 +463,28 @@ private:
                     stmt.op = "CALL";
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                         stmt.src1 = "func_" + ToHex(insn.operands[0].imm.value.u);
-                    } 
+                    }
                     else if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[0].mem.base == ZYDIS_REGISTER_RIP) {
                         uint64_t targetAddr = insn.addr + insn.instr.length + insn.operands[0].mem.disp.value;
                         std::string apiName = m_apiResolver->GetApiName(targetAddr);
                         if (!apiName.empty()) stmt.src1 = "api_" + apiName;
                         else stmt.src1 = "((void(*)())MEM(0x" + ToHex(targetAddr) + "))";
-                    } else stmt.src1 = GetOpStr(0);
+                    }
+                    else stmt.src1 = GetOpStr(0);
                 }
                 else if (m == "jmp") {
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[0].mem.base == ZYDIS_REGISTER_RIP) {
                         uint64_t targetAddr = insn.addr + insn.instr.length + insn.operands[0].mem.disp.value;
                         std::string apiName = m_apiResolver->GetApiName(targetAddr);
                         if (!apiName.empty()) {
-                            stmt.op = "CALL"; 
+                            stmt.op = "CALL";
                             stmt.src1 = "api_" + apiName;
                             func.blocks.back().pcode.push_back(stmt);
                             i++;
                             break;
                         }
                     }
-                    stmt.op = "JMP"; 
+                    stmt.op = "JMP";
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) stmt.jumpTarget = insn.operands[0].imm.value.u;
                 }
                 else if (m.rfind("j", 0) == 0) {
@@ -483,12 +499,12 @@ private:
                 i++;
                 if (m == "ret") break;
             }
-            
+
             if (func.name == "entry_point" && func.blocks[0].pcode.empty()) {
                 PCodeStmt dummy; dummy.op = "NOP"; dummy.addr = func.startAddr;
                 func.blocks[0].pcode.push_back(dummy);
             }
-            
+
             m_functions.push_back(func);
         }
     }
@@ -553,7 +569,7 @@ private:
 
     std::string EmitFunction(const Function& func) {
         std::stringstream ss;
-        
+
         ss << "void " << func.name << "() {\n";
 
         std::set<uint64_t> jumpLabels;
@@ -565,15 +581,32 @@ private:
 
         bool hasRealCode = false;
         std::string lastCmpLeft = "", lastCmpRight = "";
-        std::map<std::string, std::string> regCache; 
+        std::map<std::string, std::string> regCache;
         int unkCount = 0;
+
+        // [FIX-2] 行级去重器：连续相同行超过 3 次后折叠为注释
+        std::string lastEmittedLine;
+        int lineDupCount = 0;
+        auto EmitLine = [&](const std::string& line) {
+            if (line == lastEmittedLine) {
+                ++lineDupCount;
+                if (lineDupCount == 3) ss << "    // [repeated filler suppressed]\n";
+                if (lineDupCount >= 3) return;
+            } else {
+                lineDupCount = 0;
+                lastEmittedLine = line;
+            }
+            ss << line;
+            };
 
         for (auto& block : func.blocks) {
             if (block.isLoopHeader) ss << "    while (1) { // Loop Header\n";
             for (auto& stmt : block.pcode) {
-                
-                // 过滤大量连续的 0x00 填充
-                if (stmt.op == "ALU" && stmt.src1 == "add" && stmt.src2 == "al" && stmt.dst.find("[") == std::string::npos) {
+
+                // [FIX-2] 过滤 0x00 填充：dst 为内存，src2 是 al/eax/rax
+                if (stmt.op == "ALU" && stmt.src1 == "add" &&
+                    (stmt.src2 == "al" || stmt.src2 == "eax" || stmt.src2 == "rax") &&
+                    (stmt.dst.find("MEM(") == 0 || stmt.dst.find("[") != std::string::npos)) {
                     continue;
                 }
 
@@ -583,97 +616,111 @@ private:
 
                 if (stmt.op == "MOV" && stmt.dst.find("r") == 0) {
                     regCache[stmt.dst] = stmt.src1;
-                    continue; 
+                    continue;
                 }
-                
+
                 if (stmt.op == "LEA" && stmt.dst.find("r") == 0) {
                     if (stmt.src1.find("STR_") == 0) {
                         uint64_t addr = std::stoull(stmt.src1.substr(4), nullptr, 16);
                         auto it = m_strings.find(addr);
                         if (it != m_strings.end()) {
                             regCache[stmt.dst] = "\"" + it->second + "\"";
-                        } else {
+                        }
+                        else {
                             regCache[stmt.dst] = "(uint64_t)&MEM(" + ToHex(addr - m_imageBase) + ")";
                         }
-                    } else {
+                    }
+                    else {
                         regCache[stmt.dst] = "(uint64_t)&" + stmt.src1;
                     }
                     continue;
                 }
-                
+
                 if (stmt.op == "ALU" && stmt.src1 == "xor" && stmt.dst == stmt.src2) {
                     regCache[stmt.dst] = "0";
                     continue;
                 }
 
                 if (stmt.op == "MOV") {
-                    ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n"; hasRealCode = true;
+                    EmitLine("    " + stmt.dst + " = " + stmt.src1 + ";\n");
+                    hasRealCode = true;
                     unkCount = 0;
-                } else if (stmt.op == "SIMD_MOV") {
+                }
+                else if (stmt.op == "SIMD_MOV") {
                     hasRealCode = true; unkCount = 0;
-                } else if (stmt.op == "SIGN_EXT") {
+                }
+                else if (stmt.op == "SIGN_EXT") {
                     hasRealCode = true; unkCount = 0;
-                } else if (stmt.op == "BIT_TEST") {
+                }
+                else if (stmt.op == "BIT_TEST") {
                     hasRealCode = true; unkCount = 0;
-                } else if (stmt.op == "LEA") {
+                }
+                else if (stmt.op == "LEA") {
                     hasRealCode = true; unkCount = 0;
-                } else if (stmt.op == "ALU") {
-                    if (stmt.src1 == "inc") ss << "    " << stmt.dst << "++;\n";
-                    else if (stmt.src1 == "dec") ss << "    " << stmt.dst << "--;\n";
+                }
+                else if (stmt.op == "ALU") {
+                    if (stmt.src1 == "inc")      EmitLine("    " + stmt.dst + "++;\n");
+                    else if (stmt.src1 == "dec") EmitLine("    " + stmt.dst + "--;\n");
                     else {
                         std::string opStr = "+";
                         if (stmt.src1 == "sub") opStr = "-";
                         else if (stmt.src1 == "xor" || stmt.src1 == "pxor") opStr = "^";
                         else if (stmt.src1 == "and" || stmt.src1 == "pand") opStr = "&";
                         else if (stmt.src1 == "or" || stmt.src1 == "por") opStr = "|";
-                        ss << "    " << stmt.dst << " " << opStr << "= " << stmt.src2 << ";\n";
+                        EmitLine("    " + stmt.dst + " " + opStr + "= " + stmt.src2 + ";\n");
                     }
                     hasRealCode = true;
                     unkCount = 0;
-                } else if (stmt.op == "CMP") {
+                }
+                else if (stmt.op == "CMP") {
                     lastCmpLeft = stmt.dst; lastCmpRight = stmt.src1;
                     hasRealCode = true;
                     unkCount = 0;
-                } else if (stmt.op == "SETCC") {
+                }
+                else if (stmt.op == "SETCC") {
                     hasRealCode = true;
                     unkCount = 0;
-                } else if (stmt.op == "CMOV") {
+                }
+                else if (stmt.op == "CMOV") {
                     hasRealCode = true;
                     unkCount = 0;
-                } 
+                }
                 else if (stmt.op == "CALL") {
                     std::string a1 = regCache.count("rcx") ? regCache["rcx"] : "0";
                     std::string a2 = regCache.count("rdx") ? regCache["rdx"] : "0";
-                    std::string a3 = regCache.count("r8")  ? regCache["r8"]  : "0";
-                    std::string a4 = regCache.count("r9")  ? regCache["r9"]  : "0";
-                    
+                    std::string a3 = regCache.count("r8") ? regCache["r8"] : "0";
+                    std::string a4 = regCache.count("r9") ? regCache["r9"] : "0";
+
                     // 针对字符串类型的宽字符处理
                     if (stmt.src1.find("api_RtlInitUnicodeString") != std::string::npos) {
                         // 宽字符特殊处理（简化版）
-                        ss << "    " << stmt.src1 << "(" << a1 << ", L\"\\\\Device\\\\Beep\", " << a3 << ", " << a4 << ");\n";
-                    } else {
-                        ss << "    " << stmt.src1 << "(" << a1 << ", " << a2 << ", " << a3 << ", " << a4 << ");\n"; 
+                        EmitLine("    " + stmt.src1 + "(" + a1 + ", L\"\\\\Device\\\\Beep\", " + a3 + ", " + a4 + ");\n");
+                    }
+                    else {
+                        EmitLine("    " + stmt.src1 + "(" + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ");\n");
                     }
                     hasRealCode = true;
-                    regCache.clear(); 
+                    regCache.clear();
                     unkCount = 0;
-                } 
+                }
                 else if (stmt.op == "CJMP") {
                     hasRealCode = true;
                     unkCount = 0;
-                } else if (stmt.op == "JMP") {
+                }
+                else if (stmt.op == "JMP") {
                     hasRealCode = true;
                     unkCount = 0;
-                } 
+                }
                 else if (stmt.op == "RET") {
                     if (regCache.count("rax") && regCache["rax"] == "0") {
                         ss << "    return 0;\n";
-                    } else {
-                        ss << "    return;\n"; 
+                    }
+                    else {
+                        ss << "    return;\n";
                     }
                     hasRealCode = true;
                     unkCount = 0;
-                } 
+                }
                 else if (stmt.op == "PUSH" || stmt.op == "POP" || stmt.op == "NOP") {
                     hasRealCode = true;
                     unkCount = 0;
@@ -681,11 +728,11 @@ private:
             }
             if (block.isLoopHeader) ss << "    }\n";
         }
-        
+
         if (!hasRealCode) ss << "    // [WARNING] This function has no valid decoded instructions.\n";
 
         for (uint64_t label : jumpLabels) ss << "label_0x" << ToHex(label) << ": ;\n";
-        
+
         ss << "}\n\n";
         return ss.str();
     }
@@ -713,7 +760,7 @@ int main(int argc, char* argv[]) {
     std::vector<uint8_t> fileData((size_t)fileSize);
     file.read(reinterpret_cast<char*>(fileData.data()), fileSize);
     file.close();
-    
+
     std::cout << "[+] File Loaded. Size: " << fileSize << " bytes.\n";
 
     const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(fileData.data());
@@ -721,17 +768,18 @@ int main(int argc, char* argv[]) {
         std::cerr << "[-] Not a valid PE file (missing MZ signature).\n"; return 1;
     }
     const uint8_t* ntBase = fileData.data() + dosHeader->e_lfanew;
-    
+
     const auto* fileHeader = reinterpret_cast<const IMAGE_FILE_HEADER*>(ntBase + 4);
     const uint16_t magic = *reinterpret_cast<const uint16_t*>(ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
-    
+
     bool is64Bit = (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
     uint64_t imageBase, entryPointVA;
     if (is64Bit) {
         const auto* opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
         imageBase = opt->ImageBase;
         entryPointVA = imageBase + opt->AddressOfEntryPoint;
-    } else {
+    }
+    else {
         const auto* opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
         imageBase = opt->ImageBase;
         entryPointVA = imageBase + opt->AddressOfEntryPoint;
@@ -748,10 +796,10 @@ int main(int argc, char* argv[]) {
     std::cout << "[DEBUG] Section Table:\n";
     const IMAGE_SECTION_HEADER* targetSection = nullptr;
     for (int i = 0; i < fileHeader->NumberOfSections; ++i) {
-        std::cout << "  [" << i << "] " << std::setw(8) << std::setfill('\0') << (const char*)sections[i].Name 
-                  << " VA: 0x" << std::hex << sections[i].VirtualAddress 
-                  << " SizeOfRawData: " << std::dec << sections[i].SizeOfRawData
-                  << " Characteristics: 0x" << std::hex << sections[i].Characteristics << "\n";
+        std::cout << "  [" << i << "] " << std::setw(8) << std::setfill('\0') << (const char*)sections[i].Name
+            << " VA: 0x" << std::hex << sections[i].VirtualAddress
+            << " SizeOfRawData: " << std::dec << sections[i].SizeOfRawData
+            << " Characteristics: 0x" << std::hex << sections[i].Characteristics << "\n";
 
         if (sections[i].SizeOfRawData > 0) {
             if (strncmp((const char*)sections[i].Name, ".text", 5) == 0) {
@@ -778,8 +826,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "[DEBUG] Selected Section: " << (const char*)targetSection->Name 
-              << " (Size: " << std::dec << targetSection->SizeOfRawData << " bytes).\n";
+    std::cout << "[DEBUG] Selected Section: " << (const char*)targetSection->Name
+        << " (Size: " << std::dec << targetSection->SizeOfRawData << " bytes).\n";
 
     const uint8_t* codeData = fileData.data() + targetSection->PointerToRawData;
     uint32_t rawSize = targetSection->SizeOfRawData;
@@ -797,16 +845,17 @@ int main(int argc, char* argv[]) {
             insn.addr = virtualBase + offset;
             allInstructions.push_back(insn);
             offset += insn.instr.length;
-        } else offset += 1;
+        }
+        else offset += 1;
     }
-    
+
     std::cout << "[+] Disassembled " << allInstructions.size() << " instructions.\n";
 
     UltimateDecompiler decompiler(&apiResolver);
     decompiler.LoadStrings(fileData.data(), fileSize, ntHeader, imageBase);
-    
+
     decompiler.AnalyzeAllFunctions(allInstructions, imageBase, entryPointVA);
-    
+
     decompiler.WriteToFile(cOutputPath, allInstructions);
 
     std::cout << "[SUCCESS] Decompilation complete!\n";
