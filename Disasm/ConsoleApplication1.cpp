@@ -88,7 +88,6 @@ private:
         }
         return nullptr;
     }
-
     std::string SanitizeApiName(const std::string& rawName) {
         if (rawName.empty()) return "";
         if (rawName[0] == '?') {
@@ -96,10 +95,6 @@ private:
             if (rawName.find("put@") != std::string::npos) return "ostream_put";
             if (rawName.find("flush") != std::string::npos) return "ostream_flush";
             if (rawName.find("operator<<") != std::string::npos) return "ostream_operator_shift";
-            if (rawName.find("basic_ostream") != std::string::npos) return "ostream_basic";
-            if (rawName.find("char_traits") != std::string::npos) return "char_traits";
-            if (rawName.find("basic_ios") != std::string::npos) return "ios_basic";
-            
             std::string cleaned = "cpp_";
             for (size_t i = 1; i < rawName.length() && cleaned.length() < 20; ++i) {
                 char c = rawName[i];
@@ -151,7 +146,7 @@ struct Function {
 };
 
 // =========================================================
-// 终极反编译引擎
+// 终极反编译引擎 (全面支持 SIMD 与高级指令)
 // =========================================================
 class UltimateDecompiler {
 public:
@@ -221,9 +216,11 @@ public:
 
     void WriteToFile(const std::string& outPath, std::vector<Insn>& allInstructions) {
         std::ofstream out(outPath);
-        out << "\xEF\xBB\xBF#include <stdint.h>\n#include <windows.h>\n\n";
+        out << "\xEF\xBB\xBF#include <stdint.h>\n#include <windows.h>\n#include <string.h>\n\n";
         out << "uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8, r9, r10, r11, r12, r13, r14, r15;\n";
         out << "uint8_t memory[0x100000];\n#define MEM(a) memory[(uint32_t)(a) & 0xFFFFF]\n\n";
+        // 【新增】映射 SIMD 寄存器
+        out << "uint64_t xmm0[2], xmm1[2], xmm2[2], xmm3[2], xmm4[2], xmm5[2], xmm6[2], xmm7[2];\n\n";
 
         std::set<std::string> usedApis;
         bool printedEntry = false;
@@ -288,27 +285,8 @@ private:
         }
 
         std::string inferredName = "";
+        if (apisCalled.count("MessageBoxA") || apisCalled.count("MessageBoxW")) inferredName = "show_dialog";
         
-        if (apisCalled.count("socket") || apisCalled.count("sendto") || apisCalled.count("recvfrom")) {
-            inferredName = "network_socket";
-        } else if (apisCalled.count("connect") || apisCalled.count("bind") || apisCalled.count("listen")) {
-            inferredName = "network_connect";
-        } else if (apisCalled.count("CreateFileW") || apisCalled.count("ReadFile") || apisCalled.count("WriteFile")) {
-            inferredName = "file_io";
-        } else if (apisCalled.count("HeapAlloc") || apisCalled.count("VirtualAlloc")) {
-            inferredName = "memory_alloc";
-        } else if (apisCalled.count("MessageBoxA") || apisCalled.count("MessageBoxW")) {
-            inferredName = "show_dialog";
-        } else if (apisCalled.count("RegOpenKeyExW") || apisCalled.count("RegQueryValueExW")) {
-            inferredName = "registry_access";
-        } else if (apisCalled.count("CreateProcessW") || apisCalled.count("OpenProcess")) {
-            inferredName = "process_control";
-        } else if (apisCalled.count("CreateThread") || apisCalled.count("WaitForSingleObject")) {
-            inferredName = "thread_control";
-        } else if (apisCalled.count("WideCharToMultiByte") || apisCalled.count("MultiByteToWideChar")) {
-            inferredName = "string_convert";
-        }
-
         if (!inferredName.empty()) {
             func.name = inferredName + "_" + ToHex(func.startAddr);
         }
@@ -320,8 +298,6 @@ private:
         bool hasSecurityCookie = false;
         bool hasRtlCapture = false;
         bool hasTimeCheck = false;
-        bool hasRtlUnwind = false;
-        bool hasCxxException = false;
 
         for (auto& block : func.blocks) {
             for (auto& stmt : block.pcode) {
@@ -329,8 +305,6 @@ private:
                     if (stmt.src1.find("api_GetSystemTimeAsFileTime") != std::string::npos) hasTimeCheck = true;
                     if (stmt.src1.find("api_QueryPerformanceCounter") != std::string::npos) hasTimeCheck = true;
                     if (stmt.src1.find("api_RtlCaptureContext") != std::string::npos) hasRtlCapture = true;
-                    if (stmt.src1.find("api_RtlUnwindEx") != std::string::npos) hasRtlUnwind = true;
-                    if (stmt.src1.find("api_RaiseException") != std::string::npos) hasCxxException = true;
                 }
                 if (stmt.src1.find("0x2b992ddfa232") != std::string::npos) hasSecurityCookie = true;
             }
@@ -339,15 +313,9 @@ private:
         if (hasSecurityCookie && hasTimeCheck) {
             func.isLibraryFunc = true;
             func.libFuncName = "__security_init_cookie";
-        } else if (hasRtlCapture || hasRtlUnwind) {
+        } else if (hasRtlCapture) {
             func.isLibraryFunc = true;
             func.libFuncName = "__SEH_Exception_Handler";
-        } else if (hasCxxException) {
-            func.isLibraryFunc = true;
-            func.libFuncName = "__CxxThrowException";
-        } else if (func.blocks.size() == 1 && func.blocks[0].pcode.size() <= 2) {
-            func.isLibraryFunc = true;
-            func.libFuncName = "CRT_Stub";
         }
     }
 
@@ -366,6 +334,8 @@ private:
         if (s == "ecx") return "rcx"; if (s == "edx") return "rdx";
         if (s == "r8d") return "r8";  if (s == "r9d") return "r9";
         if (s == "eax") return "rax"; if (s == "ebx") return "rbx";
+        // 处理 XMM 寄存器
+        if (s.find("xmm") != std::string::npos) return s;
         return s;
     }
 
@@ -439,8 +409,13 @@ private:
                     return "unknown";
                 };
 
+                // 基础 MOV 及 SIMD 数据移动
                 if (m == "mov" || m == "movzx" || m == "movsxd" || m == "movsx") {
                     stmt.op = "MOV"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1);
+                }
+                else if (m.find("movdqa") != std::string::npos || m.find("movdqu") != std::string::npos || m.find("movups") != std::string::npos) {
+                    // 处理 SSE 的内存移动
+                    stmt.op = "SIMD_MOV"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1);
                 }
                 else if (m == "lea") {
                     stmt.op = "LEA"; stmt.dst = GetOpStr(0);
@@ -449,14 +424,39 @@ private:
                         stmt.src1 = "STR_" + ToHex(target);
                     } else stmt.src1 = GetOpStr(1);
                 }
-                else if (m == "add" || m == "sub" || m == "xor" || m == "and" || m == "or" || m == "shl" || m == "shr" || m == "sar") {
+                else if (m == "add" || m == "sub" || m == "xor" || m == "and" || m == "or" || m == "shl" || m == "shr" || m == "sar" || m == "pxor" || m == "pand" || m == "por") {
                     stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = GetOpStr(1);
                 }
                 else if (m == "inc" || m == "dec" || m == "neg" || m == "not") {
                     stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = "1"; 
                 }
-                else if (m == "cmp" || m == "test") {
-                    stmt.op = "CMP"; stmt.dst = GetOpStr(0); stmt.src1 = (m == "test") ? "0" : GetOpStr(1);
+                else if (m == "bt" || m == "bts" || m == "btr" || m == "btc") {
+                    // 处理位测试指令
+                    stmt.op = "BIT_TEST"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1); stmt.src2 = m;
+                }
+                else if (m == "cdqe" || m == "cdq" || m == "cwd" || m == "cqo") {
+                    // 处理符号扩展
+                    stmt.op = "SIGN_EXT"; stmt.dst = "rax"; stmt.src1 = m;
+                }
+                else if (m == "cmp") {
+                    stmt.op = "CMP"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1);
+                }
+                else if (m == "test") {
+                    stmt.op = "CMP"; stmt.dst = GetOpStr(0); stmt.src1 = "0";
+                }
+                else if (m == "cmovz" || m == "cmove" || m == "cmovnz" || m == "cmovne" || m == "cmovl" || m == "cmovg") {
+                    std::string c = "==";
+                    if (m.find("nz") != std::string::npos || m.find("ne") != std::string::npos) c = "!=";
+                    else if (m.find("l") != std::string::npos) c = "<";
+                    else if (m.find("g") != std::string::npos) c = ">";
+                    stmt.op = "CMOV"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1); stmt.src2 = c;
+                }
+                else if (m == "setz" || m == "sete" || m == "setnz" || m == "setne" || m == "setl" || m == "setg") {
+                    std::string c = "==";
+                    if (m.find("nz") != std::string::npos || m.find("ne") != std::string::npos) c = "!=";
+                    else if (m.find("l") != std::string::npos) c = "<";
+                    else if (m.find("g") != std::string::npos) c = ">";
+                    stmt.op = "SETCC"; stmt.dst = GetOpStr(0); stmt.src1 = c;
                 }
                 else if (m == "call") {
                     stmt.op = "CALL";
@@ -470,8 +470,23 @@ private:
                         else stmt.src1 = "((void(*)())MEM(0x" + ToHex(targetAddr) + "))";
                     } else stmt.src1 = GetOpStr(0);
                 }
+                else if (m == "jmp") {
+                    if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[0].mem.base == ZYDIS_REGISTER_RIP) {
+                        uint64_t targetAddr = insn.addr + insn.instr.length + insn.operands[0].mem.disp.value;
+                        std::string apiName = m_apiResolver->GetApiName(targetAddr);
+                        if (!apiName.empty()) {
+                            stmt.op = "CALL"; // 尾调用
+                            stmt.src1 = "api_" + apiName;
+                            func.blocks.back().pcode.push_back(stmt);
+                            i++;
+                            break;
+                        }
+                    }
+                    stmt.op = "JMP"; 
+                    if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) stmt.jumpTarget = insn.operands[0].imm.value.u;
+                }
                 else if (m.rfind("j", 0) == 0) {
-                    stmt.op = (m == "jmp") ? "JMP" : "CJMP"; stmt.src1 = m;
+                    stmt.op = "CJMP"; stmt.src1 = m;
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) stmt.jumpTarget = insn.operands[0].imm.value.u;
                 }
                 else if (m == "ret") { stmt.op = "RET"; }
@@ -484,9 +499,7 @@ private:
             }
             
             if (func.name == "entry_point" && func.blocks[0].pcode.empty()) {
-                PCodeStmt dummy;
-                dummy.op = "NOP";
-                dummy.addr = func.startAddr;
+                PCodeStmt dummy; dummy.op = "NOP"; dummy.addr = func.startAddr;
                 func.blocks[0].pcode.push_back(dummy);
             }
             
@@ -556,12 +569,31 @@ private:
         std::stringstream ss;
         ss << "void " << func.name << "(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
 
+        std::set<uint64_t> jumpLabels;
+        for (auto& block : func.blocks) {
+            for (auto& stmt : block.pcode) {
+                if (stmt.op == "JMP" || stmt.op == "CJMP") jumpLabels.insert(stmt.jumpTarget);
+            }
+        }
+
         bool hasRealCode = false;
+        std::string lastCmpLeft = "", lastCmpRight = "";
+
         for (auto& block : func.blocks) {
             if (block.isLoopHeader) ss << "    while (1) { // Loop Header\n";
             for (auto& stmt : block.pcode) {
                 if (stmt.op == "MOV") {
                     ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n"; hasRealCode = true;
+                } else if (stmt.op == "SIMD_MOV") {
+                    ss << "    // SIMD MOVE: " << stmt.dst << " <= " << stmt.src1 << "\n"; hasRealCode = true;
+                } else if (stmt.op == "SIGN_EXT") {
+                    ss << "    // Sign Extend: " << stmt.dst << " = (" << stmt.src1 << ")\n"; hasRealCode = true;
+                } else if (stmt.op == "BIT_TEST") {
+                    if (stmt.src2 == "bt") ss << "    // Bit Test: " << stmt.dst << " & (1 << " << stmt.src1 << ")\n";
+                    else if (stmt.src2 == "bts") ss << "    " << stmt.dst << " |= (1 << " << stmt.src1 << ");\n";
+                    else if (stmt.src2 == "btr") ss << "    " << stmt.dst << " &= ~(1 << " << stmt.src1 << ");\n";
+                    else if (stmt.src2 == "btc") ss << "    " << stmt.dst << " ^= (1 << " << stmt.src1 << ");\n";
+                    hasRealCode = true;
                 } else if (stmt.op == "LEA") {
                     if (stmt.src1.find("STR_") == 0) {
                         uint64_t addr = std::stoull(stmt.src1.substr(4), nullptr, 16);
@@ -576,17 +608,34 @@ private:
                     else if (stmt.src1 == "neg") ss << "    " << stmt.dst << " = -" << stmt.dst << ";\n";
                     else if (stmt.src1 == "not") ss << "    " << stmt.dst << " = ~" << stmt.dst << ";\n";
                     else {
-                        std::string opStr = (stmt.src1 == "add") ? "+" : (stmt.src1 == "sub") ? "-" : (stmt.src1 == "xor") ? "^" : (stmt.src1 == "and") ? "&" : (stmt.src1 == "or") ? "|" : (stmt.src1 == "shl") ? "<<" : ">>";
+                        std::string opStr = "+";
+                        if (stmt.src1 == "sub") opStr = "-";
+                        else if (stmt.src1 == "xor" || stmt.src1 == "pxor") opStr = "^";
+                        else if (stmt.src1 == "and" || stmt.src1 == "pand") opStr = "&";
+                        else if (stmt.src1 == "or" || stmt.src1 == "por") opStr = "|";
+                        else if (stmt.src1 == "shl") opStr = "<<";
+                        else if (stmt.src1 == "shr" || stmt.src1 == "sar") opStr = ">>";
                         ss << "    " << stmt.dst << " " << opStr << "= " << stmt.src2 << ";\n";
                     }
                     hasRealCode = true;
                 } else if (stmt.op == "CMP") {
-                    ss << "    // CMP " << stmt.dst << ", " << stmt.src1 << "\n"; hasRealCode = true;
+                    lastCmpLeft = stmt.dst; lastCmpRight = stmt.src1;
+                    ss << "    // CMP " << lastCmpLeft << ", " << lastCmpRight << "\n"; hasRealCode = true;
+                } else if (stmt.op == "SETCC") {
+                    if (!lastCmpLeft.empty()) ss << "    " << stmt.dst << " = (" << lastCmpLeft << " " << stmt.src1 << " " << lastCmpRight << ");\n";
+                    hasRealCode = true;
+                } else if (stmt.op == "CMOV") {
+                    if (!lastCmpLeft.empty()) ss << "    if (" << lastCmpLeft << " " << stmt.src2 << " " << lastCmpRight << ") " << stmt.dst << " = " << stmt.src1 << ";\n";
+                    hasRealCode = true;
                 } else if (stmt.op == "CALL") {
                     ss << "    " << stmt.src1 << "(rcx, rdx, r8, r9);\n"; hasRealCode = true;
                 } else if (stmt.op == "CJMP") {
                     std::string cond = (stmt.src1 == "jnz" || stmt.src1 == "jne") ? "!=" : (stmt.src1 == "jg") ? ">" : (stmt.src1 == "jl") ? "<" : "==";
-                    ss << "    if (!(rax " << cond << " 0)) break;\n"; hasRealCode = true;
+                    if (!lastCmpLeft.empty()) ss << "    if (" << lastCmpLeft << " " << cond << " " << lastCmpRight << ") goto label_0x" << ToHex(stmt.jumpTarget) << ";\n";
+                    else ss << "    if (!(rax " << cond << " 0)) goto label_0x" << ToHex(stmt.jumpTarget) << ";\n";
+                    hasRealCode = true;
+                } else if (stmt.op == "JMP") {
+                    ss << "    goto label_0x" << ToHex(stmt.jumpTarget) << ";\n"; hasRealCode = true;
                 } else if (stmt.op == "RET") {
                     ss << "    return;\n"; hasRealCode = true;
                 } else if (stmt.op == "PUSH") {
@@ -600,9 +649,9 @@ private:
             if (block.isLoopHeader) ss << "    }\n";
         }
         
-        if (!hasRealCode) {
-            ss << "    // [WARNING] This function has no valid decoded instructions.\n";
-        }
+        if (!hasRealCode) ss << "    // [WARNING] This function has no valid decoded instructions.\n";
+
+        for (uint64_t label : jumpLabels) ss << "label_0x" << ToHex(label) << ": ;\n";
         
         ss << "}\n\n";
         return ss.str();
@@ -704,11 +753,8 @@ int main(int argc, char* argv[]) {
     uint64_t virtualBase = imageBase + targetSection->VirtualAddress;
 
     ZydisDecoder decoder;
-    if (is64Bit) {
-        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-    } else {
-        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
-    }
+    if (is64Bit) ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    else ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
 
     std::vector<Insn> allInstructions;
     ZyanUSize offset = 0;
