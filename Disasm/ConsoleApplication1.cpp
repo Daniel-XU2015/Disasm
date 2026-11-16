@@ -129,7 +129,7 @@ struct Function {
 };
 
 // =========================================================
-// 终极反编译引擎 (FLIRT 识别 + P-Code)
+// 终极反编译引擎
 // =========================================================
 class UltimateDecompiler {
 public:
@@ -158,23 +158,10 @@ public:
         }
     }
 
-    void AnalyzeAllFunctions(std::vector<Insn>& allInstructions, uint64_t imageBase, uint64_t entryPointVA) {
+    void AnalyzeAllFunctions(std::vector<Insn>& allInstructions, uint64_t imageBase, uint64_t peEntryPointVA) {
         m_imageBase = imageBase;
-        std::cout << "[DEBUG] Real Entry Point VA: 0x" << std::hex << entryPointVA << std::dec << "\n";
+        FindFunctions(allInstructions, peEntryPointVA);
         
-        FindFunctions(allInstructions, entryPointVA);
-        
-        std::cout << "[DEBUG] Total Functions Found: " << m_functions.size() << "\n";
-        bool found = false;
-        for (const auto& f : m_functions) {
-            if (f.name == "entry_point") {
-                std::cout << "[DEBUG] entry_point Found in m_functions. Size: " << f.blocks.size() << " blocks.\n";
-                found = true;
-                break;
-            }
-        }
-        if (!found) std::cout << "[DEBUG] WARNING: entry_point NOT Found in m_functions!\n";
-
         unsigned int numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4;
         std::atomic<size_t> currentIndex(0);
@@ -204,19 +191,17 @@ public:
         for (auto& th : threads) th.join();
     }
 
-    void WriteToFile(const std::string& outPath) {
+    void WriteToFile(const std::string& outPath, std::vector<Insn>& allInstructions) {
         std::ofstream out(outPath);
         out << "\xEF\xBB\xBF#include <stdint.h>\n#include <windows.h>\n\n";
         out << "uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8, r9, r10, r11, r12, r13, r14, r15;\n";
         out << "uint8_t memory[0x100000];\n#define MEM(a) memory[(uint32_t)(a) & 0xFFFFF]\n\n";
 
         std::set<std::string> usedApis;
-        bool hasEntryPoint = false;
+        bool printedEntry = false;
 
         for (const auto& func : m_functions) {
             if (!func.isDead) {
-                if (func.name == "entry_point") hasEntryPoint = true;
-                
                 std::string code = func.generatedCode;
                 size_t pos = 0;
                 while ((pos = code.find("api_", pos)) != std::string::npos) {
@@ -235,13 +220,28 @@ public:
         }
 
         for (const auto& func : m_functions) {
-            if (!func.isDead && !func.generatedCode.empty()) out << func.generatedCode << "\n";
+            if (!func.isDead && !func.generatedCode.empty()) {
+                out << func.generatedCode << "\n";
+                if (func.name == "entry_point") printedEntry = true;
+            }
         }
 
-        // 【终极兜底】如果没生成 entry_point，手动补一个空的，防止链接报错
-        if (!hasEntryPoint) {
+        if (!printedEntry) {
             out << "void entry_point(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
-            out << "    // [WARNING] Fallback stub. Real entry_point was not generated.\n";
+            if (!allInstructions.empty()) {
+                out << "    // [WARNING] Zydis failed to decode. Dumping raw instructions from the buffer.\n";
+                int count = 0;
+                for (auto& insn : allInstructions) {
+                    char asmBuf[256];
+                    ZydisFormatter formatter;
+                    ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+                    ZydisFormatterFormatInstruction(&formatter, &insn.instr, insn.operands, insn.instr.operand_count_visible, asmBuf, sizeof(asmBuf), insn.addr, ZYAN_NULL);
+                    out << "    // 0x" << std::hex << insn.addr << ": " << asmBuf << "\n";
+                    if (++count > 200) break;
+                }
+            } else {
+                out << "    // [WARNING] The target file has no valid .text section or it's encrypted/packed.\n";
+            }
             out << "}\n\n";
         }
 
@@ -256,6 +256,8 @@ private:
     std::set<uint64_t> m_calledFuncs;
 
     void IdentifyLibraryCode(Function& func) {
+        if (func.name == "entry_point") return; 
+        
         bool hasSecurityCookie = false;
         bool hasRtlCapture = false;
         bool hasTimeCheck = false;
@@ -308,11 +310,20 @@ private:
         return s;
     }
 
-    void FindFunctions(std::vector<Insn>& allInstructions, uint64_t entryPointVA) {
+    void FindFunctions(std::vector<Insn>& allInstructions, uint64_t peEntryPointVA) {
         std::set<uint64_t> funcStarts;
+        uint64_t actualEntryPointVA = peEntryPointVA;
+        bool foundInText = false;
         
-        if (entryPointVA != 0) funcStarts.insert(entryPointVA);
-        if (!allInstructions.empty()) funcStarts.insert(allInstructions.front().addr);
+        if (!allInstructions.empty()) {
+            if (peEntryPointVA != 0) {
+                for (auto& insn : allInstructions) {
+                    if (insn.addr == peEntryPointVA) { foundInText = true; break; }
+                }
+            }
+            if (!foundInText) actualEntryPointVA = allInstructions.front().addr;
+            funcStarts.insert(actualEntryPointVA);
+        }
 
         for (auto& insn : allInstructions) {
             if (ZydisMnemonicGetString(insn.instr.mnemonic) == std::string("call") && insn.instr.operand_count > 0) {
@@ -324,13 +335,15 @@ private:
         }
 
         size_t i = 0;
+        bool assignedEntryPoint = false;
         while (i < allInstructions.size()) {
             Function func;
             func.startAddr = allInstructions[i].addr;
             
-            if (func.startAddr == entryPointVA || (i == 0 && entryPointVA == 0)) {
+            if (func.startAddr == actualEntryPointVA && !assignedEntryPoint) {
                 func.name = "entry_point";
                 func.isDead = false;
+                assignedEntryPoint = true;
             } else {
                 func.name = "sub_" + ToHex(func.startAddr);
                 func.isDead = true;
@@ -410,6 +423,14 @@ private:
                 i++;
                 if (m == "ret") break;
             }
+            
+            if (func.name == "entry_point" && func.blocks[0].pcode.empty()) {
+                PCodeStmt dummy;
+                dummy.op = "NOP";
+                dummy.addr = func.startAddr;
+                func.blocks[0].pcode.push_back(dummy);
+            }
+            
             m_functions.push_back(func);
         }
     }
@@ -476,11 +497,12 @@ private:
         std::stringstream ss;
         ss << "void " << func.name << "(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
 
+        bool hasRealCode = false;
         for (auto& block : func.blocks) {
             if (block.isLoopHeader) ss << "    while (1) { // Loop Header\n";
             for (auto& stmt : block.pcode) {
                 if (stmt.op == "MOV") {
-                    ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n";
+                    ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n"; hasRealCode = true;
                 } else if (stmt.op == "LEA") {
                     if (stmt.src1.find("STR_") == 0) {
                         uint64_t addr = std::stoull(stmt.src1.substr(4), nullptr, 16);
@@ -488,6 +510,7 @@ private:
                         if (it != m_strings.end()) ss << "    " << stmt.dst << " = (uint64_t)\"" << it->second << "\";\n";
                         else ss << "    " << stmt.dst << " = (uint64_t)&MEM(" << ToHex(addr - m_imageBase) << ");\n";
                     } else ss << "    " << stmt.dst << " = (uint64_t)&" << stmt.src1 << ";\n";
+                    hasRealCode = true;
                 } else if (stmt.op == "ALU") {
                     if (stmt.src1 == "inc") ss << "    " << stmt.dst << "++;\n";
                     else if (stmt.src1 == "dec") ss << "    " << stmt.dst << "--;\n";
@@ -497,23 +520,31 @@ private:
                         std::string opStr = (stmt.src1 == "add") ? "+" : (stmt.src1 == "sub") ? "-" : (stmt.src1 == "xor") ? "^" : (stmt.src1 == "and") ? "&" : (stmt.src1 == "or") ? "|" : (stmt.src1 == "shl") ? "<<" : ">>";
                         ss << "    " << stmt.dst << " " << opStr << "= " << stmt.src2 << ";\n";
                     }
+                    hasRealCode = true;
                 } else if (stmt.op == "CMP") {
-                    ss << "    // CMP " << stmt.dst << ", " << stmt.src1 << "\n";
+                    ss << "    // CMP " << stmt.dst << ", " << stmt.src1 << "\n"; hasRealCode = true;
                 } else if (stmt.op == "CALL") {
-                    ss << "    " << stmt.src1 << "(rcx, rdx, r8, r9);\n";
+                    ss << "    " << stmt.src1 << "(rcx, rdx, r8, r9);\n"; hasRealCode = true;
                 } else if (stmt.op == "CJMP") {
                     std::string cond = (stmt.src1 == "jnz" || stmt.src1 == "jne") ? "!=" : (stmt.src1 == "jg") ? ">" : (stmt.src1 == "jl") ? "<" : "==";
-                    ss << "    if (!(rax " << cond << " 0)) break;\n";
+                    ss << "    if (!(rax " << cond << " 0)) break;\n"; hasRealCode = true;
                 } else if (stmt.op == "RET") {
-                    ss << "    return;\n";
+                    ss << "    return;\n"; hasRealCode = true;
                 } else if (stmt.op == "PUSH") {
-                    ss << "    // push_stack(" << stmt.src1 << ");\n";
+                    ss << "    // push_stack(" << stmt.src1 << ");\n"; hasRealCode = true;
                 } else if (stmt.op == "POP") {
-                    ss << "    " << stmt.dst << " = pop_stack();\n";
+                    ss << "    " << stmt.dst << " = pop_stack();\n"; hasRealCode = true;
+                } else if (stmt.op == "NOP") {
+                    ss << "    // NOP placeholder\n"; hasRealCode = true;
                 }
             }
             if (block.isLoopHeader) ss << "    }\n";
         }
+        
+        if (!hasRealCode) {
+            ss << "    // [WARNING] This function has no valid decoded instructions.\n";
+        }
+        
         ss << "}\n\n";
         return ss.str();
     }
@@ -535,45 +566,97 @@ int main(int argc, char* argv[]) {
     if (exePath.empty() || cOutputPath.empty()) return 1;
 
     std::ifstream file(exePath, std::ios::binary | std::ios::ate);
-    if (!file) return 1;
+    if (!file) { std::cerr << "Error: Cannot open file.\n"; return 1; }
     std::streamsize fileSize = file.tellg();
     file.seekg(0, std::ios::beg);
     std::vector<uint8_t> fileData((size_t)fileSize);
     file.read(reinterpret_cast<char*>(fileData.data()), fileSize);
     file.close();
+    
     std::cout << "[+] File Loaded. Size: " << fileSize << " bytes.\n";
 
     const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(fileData.data());
+    if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
+        std::cerr << "[-] Not a valid PE file (missing MZ signature).\n"; return 1;
+    }
     const uint8_t* ntBase = fileData.data() + dosHeader->e_lfanew;
-    const auto* ntHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(ntBase);
     
-    uint64_t imageBase = ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC 
-        ? reinterpret_cast<const IMAGE_NT_HEADERS64*>(ntHeader)->OptionalHeader.ImageBase 
-        : reinterpret_cast<const IMAGE_NT_HEADERS32*>(ntHeader)->OptionalHeader.ImageBase;
-
-    // 获取入口点 VA
-    uint64_t entryPointVA = imageBase + ntHeader->OptionalHeader.AddressOfEntryPoint;
+    // 兼容 32/64 位 PE 头
+    const auto* fileHeader = reinterpret_cast<const IMAGE_FILE_HEADER*>(ntBase + 4);
+    const uint16_t magic = *reinterpret_cast<const uint16_t*>(ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
+    
+    bool is64Bit = (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
+    uint64_t imageBase, entryPointVA;
+    if (is64Bit) {
+        const auto* opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
+        imageBase = opt->ImageBase;
+        entryPointVA = imageBase + opt->AddressOfEntryPoint;
+    } else {
+        const auto* opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
+        imageBase = opt->ImageBase;
+        entryPointVA = imageBase + opt->AddressOfEntryPoint;
+    }
 
     ApiResolver apiResolver;
+    // 使用兼容后的头信息进行导入表解析
+    const auto* ntHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(ntBase);
     apiResolver.LoadImports(fileData.data(), fileSize, ntHeader, imageBase);
     std::cout << "[+] Imports Parsed.\n";
 
-    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(IMAGE_FIRST_SECTION(ntHeader));
-    const IMAGE_SECTION_HEADER* codeSection = nullptr;
-    for (int i = 0; i < ntHeader->FileHeader.NumberOfSections; ++i) {
-        if (strncmp(reinterpret_cast<const char*>(sections[i].Name), ".text", 5) == 0) { codeSection = &sections[i]; break; }
+    const uint8_t* sectionStart = ntBase + 4 + sizeof(IMAGE_FILE_HEADER) + fileHeader->SizeOfOptionalHeader;
+    const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(sectionStart);
+
+    // 【核心修复】智能寻找代码节
+    std::cout << "[DEBUG] Section Table:\n";
+    const IMAGE_SECTION_HEADER* targetSection = nullptr;
+    for (int i = 0; i < fileHeader->NumberOfSections; ++i) {
+        std::cout << "  [" << i << "] " << std::setw(8) << std::setfill('\0') << (const char*)sections[i].Name 
+                  << " VA: 0x" << std::hex << sections[i].VirtualAddress 
+                  << " SizeOfRawData: " << std::dec << sections[i].SizeOfRawData
+                  << " Characteristics: 0x" << std::hex << sections[i].Characteristics << "\n";
+
+        // 如果是 .text，或者有可执行/代码属性且大小大于0，就选它
+        if (sections[i].SizeOfRawData > 0) {
+            if (strncmp((const char*)sections[i].Name, ".text", 5) == 0) {
+                targetSection = &sections[i];
+                break; // 优先 .text
+            }
+            if (!targetSection && (sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
+                targetSection = &sections[i]; // 次选可执行节
+            }
+        }
     }
-    if (!codeSection) return 1;
 
-    const uint8_t* codeData = fileData.data() + codeSection->PointerToRawData;
-    uint32_t rawSize = codeSection->SizeOfRawData;
-    uint64_t virtualBase = imageBase + codeSection->VirtualAddress;
+    if (!targetSection) {
+        // 如果都没有，就随便找个有数据的节
+        for (int i = 0; i < fileHeader->NumberOfSections; ++i) {
+            if (sections[i].SizeOfRawData > 0) {
+                targetSection = &sections[i];
+                break;
+            }
+        }
+    }
 
+    if (!targetSection) {
+        std::cerr << "[-] No executable section with raw data found.\n";
+        return 1;
+    }
+
+    std::cout << "[DEBUG] Selected Section: " << (const char*)targetSection->Name 
+              << " (Size: " << std::dec << targetSection->SizeOfRawData << " bytes).\n";
+
+    const uint8_t* codeData = fileData.data() + targetSection->PointerToRawData;
+    uint32_t rawSize = targetSection->SizeOfRawData;
+    uint64_t virtualBase = imageBase + targetSection->VirtualAddress;
+
+    // 【核心修复】根据 32/64 位模式初始化 Zydis 解码器
     ZydisDecoder decoder;
-    if (ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-    else ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+    if (is64Bit) {
+        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    } else {
+        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
+    }
 
-    std::cout << "[*] Disassembling...\n";
     std::vector<Insn> allInstructions;
     ZyanUSize offset = 0;
     while (offset < rawSize) {
@@ -584,17 +667,16 @@ int main(int argc, char* argv[]) {
             offset += insn.instr.length;
         } else offset += 1;
     }
+    
     std::cout << "[+] Disassembled " << allInstructions.size() << " instructions.\n";
 
-    std::cout << "[*] Running P-Code Pipeline & FLIRT Matching...\n";
     UltimateDecompiler decompiler(&apiResolver);
+    // 这里的 LoadStrings 需要真实的 ntHeader，可能是 32 位也可能是 64 位
     decompiler.LoadStrings(fileData.data(), fileSize, ntHeader, imageBase);
     
-    // 传入 entryPointVA
     decompiler.AnalyzeAllFunctions(allInstructions, imageBase, entryPointVA);
     
-    std::cout << "[*] Writing C Code...\n";
-    decompiler.WriteToFile(cOutputPath);
+    decompiler.WriteToFile(cOutputPath, allInstructions);
 
     std::cout << "[SUCCESS] Decompilation complete!\n";
     std::cout << "Output saved to: " << cOutputPath << "\n";
