@@ -146,7 +146,7 @@ struct Function {
 };
 
 // =========================================================
-// 终极反编译引擎 (全面支持 SIMD 与高级指令)
+// 终极反编译引擎
 // =========================================================
 class UltimateDecompiler {
 public:
@@ -219,7 +219,6 @@ public:
         out << "\xEF\xBB\xBF#include <stdint.h>\n#include <windows.h>\n#include <string.h>\n\n";
         out << "uint64_t rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8, r9, r10, r11, r12, r13, r14, r15;\n";
         out << "uint8_t memory[0x100000];\n#define MEM(a) memory[(uint32_t)(a) & 0xFFFFF]\n\n";
-        // 【新增】映射 SIMD 寄存器
         out << "uint64_t xmm0[2], xmm1[2], xmm2[2], xmm3[2], xmm4[2], xmm5[2], xmm6[2], xmm7[2];\n\n";
 
         std::set<std::string> usedApis;
@@ -286,6 +285,8 @@ private:
 
         std::string inferredName = "";
         if (apisCalled.count("MessageBoxA") || apisCalled.count("MessageBoxW")) inferredName = "show_dialog";
+        else if (apisCalled.count("socket") || apisCalled.count("sendto")) inferredName = "network_socket";
+        else if (apisCalled.count("CreateFileW") || apisCalled.count("ReadFile")) inferredName = "file_io";
         
         if (!inferredName.empty()) {
             func.name = inferredName + "_" + ToHex(func.startAddr);
@@ -334,7 +335,6 @@ private:
         if (s == "ecx") return "rcx"; if (s == "edx") return "rdx";
         if (s == "r8d") return "r8";  if (s == "r9d") return "r9";
         if (s == "eax") return "rax"; if (s == "ebx") return "rbx";
-        // 处理 XMM 寄存器
         if (s.find("xmm") != std::string::npos) return s;
         return s;
     }
@@ -409,12 +409,10 @@ private:
                     return "unknown";
                 };
 
-                // 基础 MOV 及 SIMD 数据移动
                 if (m == "mov" || m == "movzx" || m == "movsxd" || m == "movsx") {
                     stmt.op = "MOV"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1);
                 }
                 else if (m.find("movdqa") != std::string::npos || m.find("movdqu") != std::string::npos || m.find("movups") != std::string::npos) {
-                    // 处理 SSE 的内存移动
                     stmt.op = "SIMD_MOV"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1);
                 }
                 else if (m == "lea") {
@@ -431,11 +429,9 @@ private:
                     stmt.op = "ALU"; stmt.dst = GetOpStr(0); stmt.src1 = m; stmt.src2 = "1"; 
                 }
                 else if (m == "bt" || m == "bts" || m == "btr" || m == "btc") {
-                    // 处理位测试指令
                     stmt.op = "BIT_TEST"; stmt.dst = GetOpStr(0); stmt.src1 = GetOpStr(1); stmt.src2 = m;
                 }
                 else if (m == "cdqe" || m == "cdq" || m == "cwd" || m == "cqo") {
-                    // 处理符号扩展
                     stmt.op = "SIGN_EXT"; stmt.dst = "rax"; stmt.src1 = m;
                 }
                 else if (m == "cmp") {
@@ -475,7 +471,7 @@ private:
                         uint64_t targetAddr = insn.addr + insn.instr.length + insn.operands[0].mem.disp.value;
                         std::string apiName = m_apiResolver->GetApiName(targetAddr);
                         if (!apiName.empty()) {
-                            stmt.op = "CALL"; // 尾调用
+                            stmt.op = "CALL"; 
                             stmt.src1 = "api_" + apiName;
                             func.blocks.back().pcode.push_back(stmt);
                             i++;
@@ -578,10 +574,26 @@ private:
 
         bool hasRealCode = false;
         std::string lastCmpLeft = "", lastCmpRight = "";
+        std::map<std::string, std::string> regCache; 
 
         for (auto& block : func.blocks) {
             if (block.isLoopHeader) ss << "    while (1) { // Loop Header\n";
             for (auto& stmt : block.pcode) {
+                
+                if (stmt.op == "ALU" && stmt.dst == "rsp" && (stmt.src1 == "add" || stmt.src1 == "sub")) {
+                    continue;
+                }
+
+                if (stmt.op == "MOV" && stmt.dst.find("r") == 0) {
+                    regCache[stmt.dst] = stmt.src1;
+                    continue; 
+                }
+                
+                if (stmt.op == "ALU" && stmt.src1 == "xor" && stmt.dst == stmt.src2) {
+                    regCache[stmt.dst] = "0";
+                    continue;
+                }
+
                 if (stmt.op == "MOV") {
                     ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n"; hasRealCode = true;
                 } else if (stmt.op == "SIMD_MOV") {
@@ -627,23 +639,39 @@ private:
                 } else if (stmt.op == "CMOV") {
                     if (!lastCmpLeft.empty()) ss << "    if (" << lastCmpLeft << " " << stmt.src2 << " " << lastCmpRight << ") " << stmt.dst << " = " << stmt.src1 << ";\n";
                     hasRealCode = true;
-                } else if (stmt.op == "CALL") {
-                    ss << "    " << stmt.src1 << "(rcx, rdx, r8, r9);\n"; hasRealCode = true;
-                } else if (stmt.op == "CJMP") {
+                } 
+                else if (stmt.op == "CALL") {
+                    std::string a1 = regCache.count("rcx") ? regCache["rcx"] : "rcx";
+                    std::string a2 = regCache.count("rdx") ? regCache["rdx"] : "rdx";
+                    std::string a3 = regCache.count("r8")  ? regCache["r8"]  : "r8";
+                    std::string a4 = regCache.count("r9")  ? regCache["r9"]  : "r9";
+                    
+                    ss << "    " << stmt.src1 << "(" << a1 << ", " << a2 << ", " << a3 << ", " << a4 << ");\n"; 
+                    hasRealCode = true;
+                    regCache.clear(); 
+                } 
+                else if (stmt.op == "CJMP") {
                     std::string cond = (stmt.src1 == "jnz" || stmt.src1 == "jne") ? "!=" : (stmt.src1 == "jg") ? ">" : (stmt.src1 == "jl") ? "<" : "==";
                     if (!lastCmpLeft.empty()) ss << "    if (" << lastCmpLeft << " " << cond << " " << lastCmpRight << ") goto label_0x" << ToHex(stmt.jumpTarget) << ";\n";
                     else ss << "    if (!(rax " << cond << " 0)) goto label_0x" << ToHex(stmt.jumpTarget) << ";\n";
                     hasRealCode = true;
                 } else if (stmt.op == "JMP") {
                     ss << "    goto label_0x" << ToHex(stmt.jumpTarget) << ";\n"; hasRealCode = true;
-                } else if (stmt.op == "RET") {
-                    ss << "    return;\n"; hasRealCode = true;
-                } else if (stmt.op == "PUSH") {
-                    ss << "    // push_stack(" << stmt.src1 << ");\n"; hasRealCode = true;
+                } 
+                else if (stmt.op == "RET") {
+                    if (regCache.count("rax") && regCache["rax"] == "0") {
+                        ss << "    return 0;\n";
+                    } else {
+                        ss << "    return;\n"; 
+                    }
+                    hasRealCode = true;
+                } 
+                else if (stmt.op == "PUSH") {
+                    hasRealCode = true;
                 } else if (stmt.op == "POP") {
-                    ss << "    " << stmt.dst << " = pop_stack();\n"; hasRealCode = true;
+                    hasRealCode = true;
                 } else if (stmt.op == "NOP") {
-                    ss << "    // NOP placeholder\n"; hasRealCode = true;
+                    hasRealCode = true;
                 }
             }
             if (block.isLoopHeader) ss << "    }\n";
