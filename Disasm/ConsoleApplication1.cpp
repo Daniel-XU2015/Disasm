@@ -123,8 +123,8 @@ struct Function {
     std::string name;
     std::vector<BasicBlock> blocks;
     bool isDead = true;
-    bool isLibraryFunc = false; // 【新增】FLIRT 识别标记
-    std::string libFuncName;    // 【新增】识别的库函数名称
+    bool isLibraryFunc = false;
+    std::string libFuncName;
     std::string generatedCode;
 };
 
@@ -158,9 +158,10 @@ public:
         }
     }
 
-    void AnalyzeAllFunctions(std::vector<Insn>& allInstructions, uint64_t imageBase) {
+    // 【修复】加入 entryPointVA 参数
+    void AnalyzeAllFunctions(std::vector<Insn>& allInstructions, uint64_t imageBase, uint64_t entryPointVA) {
         m_imageBase = imageBase;
-        FindFunctions(allInstructions);
+        FindFunctions(allInstructions, entryPointVA);
         
         unsigned int numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4;
@@ -175,10 +176,7 @@ public:
                     Function& func = m_functions[idx];
                     if (func.isDead) continue;
                     
-                    // 【核心步骤】FLIRT 库函数特征识别
                     IdentifyLibraryCode(func);
-                    
-                    // 如果是库函数，直接跳过复杂的反编译逻辑，节省算力
                     if (func.isLibraryFunc) {
                         func.generatedCode = EmitLibraryStub(func);
                         continue;
@@ -234,7 +232,6 @@ private:
     std::unordered_map<uint64_t, std::string> m_strings;
     std::set<uint64_t> m_calledFuncs;
 
-    // 【新增】FLIRT 智能特征识别
     void IdentifyLibraryCode(Function& func) {
         bool hasSecurityCookie = false;
         bool hasRtlCapture = false;
@@ -251,7 +248,6 @@ private:
                     if (stmt.src1.find("api_RtlUnwindEx") != std::string::npos) hasRtlUnwind = true;
                     if (stmt.src1.find("api_RaiseException") != std::string::npos) hasCxxException = true;
                 }
-                // 检测栈保护魔数 0x2b992ddfa232
                 if (stmt.src1.find("0x2b992ddfa232") != std::string::npos) hasSecurityCookie = true;
             }
         }
@@ -266,13 +262,11 @@ private:
             func.isLibraryFunc = true;
             func.libFuncName = "__CxxThrowException";
         } else if (func.blocks.size() == 1 && func.blocks[0].pcode.size() <= 2) {
-            // 过滤极其短小的库跳板代码
             func.isLibraryFunc = true;
             func.libFuncName = "CRT_Stub";
         }
     }
 
-    // 生成折叠后的库函数占位符
     std::string EmitLibraryStub(const Function& func) {
         std::stringstream ss;
         ss << "void " << func.name << "(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
@@ -291,9 +285,17 @@ private:
         return s;
     }
 
-    void FindFunctions(std::vector<Insn>& allInstructions) {
+    // 【修复】强制将入口点加入函数列表，并设为非死代码
+    void FindFunctions(std::vector<Insn>& allInstructions, uint64_t entryPointVA) {
         std::set<uint64_t> funcStarts;
-        if (!allInstructions.empty()) funcStarts.insert(allInstructions.front().addr);
+        
+        // 强制插入真实的 PE 入口点
+        if (entryPointVA != 0) {
+            funcStarts.insert(entryPointVA);
+        }
+        if (!allInstructions.empty()) {
+            funcStarts.insert(allInstructions.front().addr);
+        }
 
         for (auto& insn : allInstructions) {
             if (ZydisMnemonicGetString(insn.instr.mnemonic) == std::string("call") && insn.instr.operand_count > 0) {
@@ -308,12 +310,20 @@ private:
         while (i < allInstructions.size()) {
             Function func;
             func.startAddr = allInstructions[i].addr;
-            func.name = (i == 0) ? "entry_point" : "sub_" + ToHex(func.startAddr);
-            func.isDead = true;
+            
+            // 如果当前地址就是入口点，或者是对应调用的函数，才给名字，否则叫 sub_xxx
+            if (func.startAddr == entryPointVA || (i == 0 && entryPointVA == 0)) {
+                func.name = "entry_point";
+                func.isDead = false; // 入口点绝对不能当作死代码丢弃
+            } else {
+                func.name = "sub_" + ToHex(func.startAddr);
+                func.isDead = true;
+            }
+            
             func.blocks.push_back({});
 
             while (i < allInstructions.size()) {
-                if (i > 0 && funcStarts.count(allInstructions[i].addr)) break;
+                if (i > 0 && funcStarts.count(allInstructions[i].addr) && allInstructions[i].addr != func.startAddr) break;
                 Insn& insn = allInstructions[i];
                 std::string m = ZydisMnemonicGetString(insn.instr.mnemonic);
                 
@@ -525,6 +535,9 @@ int main(int argc, char* argv[]) {
         ? reinterpret_cast<const IMAGE_NT_HEADERS64*>(ntHeader)->OptionalHeader.ImageBase 
         : reinterpret_cast<const IMAGE_NT_HEADERS32*>(ntHeader)->OptionalHeader.ImageBase;
 
+    // 获取入口点 VA
+    uint64_t entryPointVA = imageBase + ntHeader->OptionalHeader.AddressOfEntryPoint;
+
     ApiResolver apiResolver;
     apiResolver.LoadImports(fileData.data(), fileSize, ntHeader, imageBase);
     std::cout << "[+] Imports Parsed.\n";
@@ -560,7 +573,9 @@ int main(int argc, char* argv[]) {
     std::cout << "[*] Running P-Code Pipeline & FLIRT Matching...\n";
     UltimateDecompiler decompiler(&apiResolver);
     decompiler.LoadStrings(fileData.data(), fileSize, ntHeader, imageBase);
-    decompiler.AnalyzeAllFunctions(allInstructions, imageBase);
+    
+    // 传入 entryPointVA
+    decompiler.AnalyzeAllFunctions(allInstructions, imageBase, entryPointVA);
     
     std::cout << "[*] Writing C Code...\n";
     decompiler.WriteToFile(cOutputPath);
