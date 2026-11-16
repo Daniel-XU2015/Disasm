@@ -64,7 +64,7 @@ public:
                 if (!(thunkData->u1.Ordinal & IMAGE_ORDINAL_FLAG64)) {
                     const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
                         RvaToFileOffset(fileData, fileSize, ntHeader, thunkData->u1.AddressOfData));
-                    if (importByName) m_iatMap[iatAddress] = std::string(importByName->Name);
+                    if (importByName) m_iatMap[iatAddress] = SanitizeApiName(std::string(importByName->Name));
                 }
                 iatAddress += (ntHeader->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) ? 4 : 8;
                 thunkData++;
@@ -87,6 +87,28 @@ private:
             }
         }
         return nullptr;
+    }
+
+    std::string SanitizeApiName(const std::string& rawName) {
+        if (rawName.empty()) return "";
+        if (rawName[0] == '?') {
+            if (rawName.find("widen") != std::string::npos) return "ios_widen";
+            if (rawName.find("put@") != std::string::npos) return "ostream_put";
+            if (rawName.find("flush") != std::string::npos) return "ostream_flush";
+            if (rawName.find("operator<<") != std::string::npos) return "ostream_operator_shift";
+            if (rawName.find("basic_ostream") != std::string::npos) return "ostream_basic";
+            if (rawName.find("char_traits") != std::string::npos) return "char_traits";
+            if (rawName.find("basic_ios") != std::string::npos) return "ios_basic";
+            
+            std::string cleaned = "cpp_";
+            for (size_t i = 1; i < rawName.length() && cleaned.length() < 20; ++i) {
+                char c = rawName[i];
+                if (isalnum(c) || c == '_') cleaned += c;
+                else if (c == '@') break; 
+            }
+            return cleaned;
+        }
+        return rawName;
     }
 };
 
@@ -162,6 +184,12 @@ public:
         m_imageBase = imageBase;
         FindFunctions(allInstructions, peEntryPointVA);
         
+        for (auto& func : m_functions) {
+            if (!func.isDead) {
+                InferFunctionName(func);
+            }
+        }
+
         unsigned int numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4;
         std::atomic<size_t> currentIndex(0);
@@ -207,7 +235,8 @@ public:
                 while ((pos = code.find("api_", pos)) != std::string::npos) {
                     size_t end = pos + 4;
                     while (end < code.length() && (isalnum((unsigned char)code[end]) || code[end] == '_')) end++;
-                    usedApis.insert(code.substr(pos + 4, end - pos - 4));
+                    std::string apiName = code.substr(pos + 4, end - pos - 4);
+                    if (!apiName.empty()) usedApis.insert(apiName);
                     pos = end;
                 }
             }
@@ -215,7 +244,11 @@ public:
 
         if (!usedApis.empty()) {
             out << "// --- API Mapping ---\n";
-            for (const auto& api : usedApis) out << "#define api_" << api << " " << api << "\n";
+            for (const auto& api : usedApis) {
+                if (!api.empty()) {
+                    out << "#define api_" << api << " " << api << "\n";
+                }
+            }
             out << "\n";
         }
 
@@ -228,20 +261,7 @@ public:
 
         if (!printedEntry) {
             out << "void entry_point(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
-            if (!allInstructions.empty()) {
-                out << "    // [WARNING] Zydis failed to decode. Dumping raw instructions from the buffer.\n";
-                int count = 0;
-                for (auto& insn : allInstructions) {
-                    char asmBuf[256];
-                    ZydisFormatter formatter;
-                    ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
-                    ZydisFormatterFormatInstruction(&formatter, &insn.instr, insn.operands, insn.instr.operand_count_visible, asmBuf, sizeof(asmBuf), insn.addr, ZYAN_NULL);
-                    out << "    // 0x" << std::hex << insn.addr << ": " << asmBuf << "\n";
-                    if (++count > 200) break;
-                }
-            } else {
-                out << "    // [WARNING] The target file has no valid .text section or it's encrypted/packed.\n";
-            }
+            out << "    // [WARNING] Entry point missing.\n";
             out << "}\n\n";
         }
 
@@ -254,6 +274,45 @@ private:
     std::vector<Function> m_functions;
     std::unordered_map<uint64_t, std::string> m_strings;
     std::set<uint64_t> m_calledFuncs;
+
+    void InferFunctionName(Function& func) {
+        if (func.name == "entry_point") return;
+
+        std::set<std::string> apisCalled;
+        for (auto& block : func.blocks) {
+            for (auto& stmt : block.pcode) {
+                if (stmt.op == "CALL" && stmt.src1.find("api_") == 0) {
+                    apisCalled.insert(stmt.src1.substr(4));
+                }
+            }
+        }
+
+        std::string inferredName = "";
+        
+        if (apisCalled.count("socket") || apisCalled.count("sendto") || apisCalled.count("recvfrom")) {
+            inferredName = "network_socket";
+        } else if (apisCalled.count("connect") || apisCalled.count("bind") || apisCalled.count("listen")) {
+            inferredName = "network_connect";
+        } else if (apisCalled.count("CreateFileW") || apisCalled.count("ReadFile") || apisCalled.count("WriteFile")) {
+            inferredName = "file_io";
+        } else if (apisCalled.count("HeapAlloc") || apisCalled.count("VirtualAlloc")) {
+            inferredName = "memory_alloc";
+        } else if (apisCalled.count("MessageBoxA") || apisCalled.count("MessageBoxW")) {
+            inferredName = "show_dialog";
+        } else if (apisCalled.count("RegOpenKeyExW") || apisCalled.count("RegQueryValueExW")) {
+            inferredName = "registry_access";
+        } else if (apisCalled.count("CreateProcessW") || apisCalled.count("OpenProcess")) {
+            inferredName = "process_control";
+        } else if (apisCalled.count("CreateThread") || apisCalled.count("WaitForSingleObject")) {
+            inferredName = "thread_control";
+        } else if (apisCalled.count("WideCharToMultiByte") || apisCalled.count("MultiByteToWideChar")) {
+            inferredName = "string_convert";
+        }
+
+        if (!inferredName.empty()) {
+            func.name = inferredName + "_" + ToHex(func.startAddr);
+        }
+    }
 
     void IdentifyLibraryCode(Function& func) {
         if (func.name == "entry_point") return; 
@@ -345,7 +404,7 @@ private:
                 func.isDead = false;
                 assignedEntryPoint = true;
             } else {
-                func.name = "sub_" + ToHex(func.startAddr);
+                func.name = "func_" + ToHex(func.startAddr);
                 func.isDead = true;
             }
             
@@ -402,7 +461,7 @@ private:
                 else if (m == "call") {
                     stmt.op = "CALL";
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                        stmt.src1 = "sub_" + ToHex(insn.operands[0].imm.value.u);
+                        stmt.src1 = "func_" + ToHex(insn.operands[0].imm.value.u);
                     } 
                     else if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[0].mem.base == ZYDIS_REGISTER_RIP) {
                         uint64_t targetAddr = insn.addr + insn.instr.length + insn.operands[0].mem.disp.value;
@@ -581,7 +640,6 @@ int main(int argc, char* argv[]) {
     }
     const uint8_t* ntBase = fileData.data() + dosHeader->e_lfanew;
     
-    // 兼容 32/64 位 PE 头
     const auto* fileHeader = reinterpret_cast<const IMAGE_FILE_HEADER*>(ntBase + 4);
     const uint16_t magic = *reinterpret_cast<const uint16_t*>(ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
     
@@ -598,7 +656,6 @@ int main(int argc, char* argv[]) {
     }
 
     ApiResolver apiResolver;
-    // 使用兼容后的头信息进行导入表解析
     const auto* ntHeader = reinterpret_cast<const IMAGE_NT_HEADERS*>(ntBase);
     apiResolver.LoadImports(fileData.data(), fileSize, ntHeader, imageBase);
     std::cout << "[+] Imports Parsed.\n";
@@ -606,7 +663,6 @@ int main(int argc, char* argv[]) {
     const uint8_t* sectionStart = ntBase + 4 + sizeof(IMAGE_FILE_HEADER) + fileHeader->SizeOfOptionalHeader;
     const auto* sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(sectionStart);
 
-    // 【核心修复】智能寻找代码节
     std::cout << "[DEBUG] Section Table:\n";
     const IMAGE_SECTION_HEADER* targetSection = nullptr;
     for (int i = 0; i < fileHeader->NumberOfSections; ++i) {
@@ -615,20 +671,18 @@ int main(int argc, char* argv[]) {
                   << " SizeOfRawData: " << std::dec << sections[i].SizeOfRawData
                   << " Characteristics: 0x" << std::hex << sections[i].Characteristics << "\n";
 
-        // 如果是 .text，或者有可执行/代码属性且大小大于0，就选它
         if (sections[i].SizeOfRawData > 0) {
             if (strncmp((const char*)sections[i].Name, ".text", 5) == 0) {
                 targetSection = &sections[i];
-                break; // 优先 .text
+                break;
             }
             if (!targetSection && (sections[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) {
-                targetSection = &sections[i]; // 次选可执行节
+                targetSection = &sections[i];
             }
         }
     }
 
     if (!targetSection) {
-        // 如果都没有，就随便找个有数据的节
         for (int i = 0; i < fileHeader->NumberOfSections; ++i) {
             if (sections[i].SizeOfRawData > 0) {
                 targetSection = &sections[i];
@@ -649,7 +703,6 @@ int main(int argc, char* argv[]) {
     uint32_t rawSize = targetSection->SizeOfRawData;
     uint64_t virtualBase = imageBase + targetSection->VirtualAddress;
 
-    // 【核心修复】根据 32/64 位模式初始化 Zydis 解码器
     ZydisDecoder decoder;
     if (is64Bit) {
         ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
@@ -671,7 +724,6 @@ int main(int argc, char* argv[]) {
     std::cout << "[+] Disassembled " << allInstructions.size() << " instructions.\n";
 
     UltimateDecompiler decompiler(&apiResolver);
-    // 这里的 LoadStrings 需要真实的 ntHeader，可能是 32 位也可能是 64 位
     decompiler.LoadStrings(fileData.data(), fileSize, ntHeader, imageBase);
     
     decompiler.AnalyzeAllFunctions(allInstructions, imageBase, entryPointVA);
