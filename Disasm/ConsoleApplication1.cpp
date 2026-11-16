@@ -127,7 +127,7 @@ struct Function {
 };
 
 // =========================================================
-// 终极反编译引擎 (支持全指令集 P-Code 翻译)
+// 终极反编译引擎 (全面净化版)
 // =========================================================
 class UltimateDecompiler {
 public:
@@ -258,44 +258,71 @@ private:
                 if (i > 0 && funcStarts.count(allInstructions[i].addr)) break;
                 Insn& insn = allInstructions[i];
                 std::string m = ZydisMnemonicGetString(insn.instr.mnemonic);
-                if (m == "call" || m == "add" || m == "sub" || m == "xor" || m.rfind("j", 0) == 0) func.isDead = false;
+                
+                // 如果是纯垃圾指令，直接跳过不处理
+                if (m == "int3" || m == "nop" || m == "endbr64" || m == "invalid") {
+                    i++; continue;
+                }
+
+                if (m == "call" || m == "add" || m == "sub" || m == "xor" || m.rfind("j", 0) == 0 || m == "ret") func.isDead = false;
                 
                 PCodeStmt stmt;
                 stmt.addr = insn.addr;
                 stmt.op = "UNK";
                 stmt.dst = ""; stmt.src1 = ""; stmt.src2 = ""; stmt.jumpTarget = 0;
 
-                // 【核心强化】接管所有常见底层指令
+                // 获取操作数字符串的辅助 lambda
+                auto GetOpStr = [&](int idx) -> std::string {
+                    if (idx >= insn.instr.operand_count) return "";
+                    auto& op = insn.operands[idx];
+                    if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) return GetRegName(op.reg.value);
+                    if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) return "0x" + ToHex(op.imm.value.u);
+                    if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        std::string res = "MEM(";
+                        if (op.mem.base != ZYDIS_REGISTER_NONE) res += GetRegName(op.mem.base);
+                        if (op.mem.disp.value != 0) res += (op.mem.disp.value > 0 ? "+" : "") + std::to_string(op.mem.disp.value);
+                        res += ")";
+                        return res;
+                    }
+                    return "unknown";
+                };
+
                 if (m == "mov" || m == "movzx" || m == "movsxd" || m == "movsx") {
                     stmt.op = "MOV";
-                    if (insn.instr.operand_count > 0) stmt.dst = GetRegName(insn.operands[0].reg.value);
-                    if (insn.instr.operand_count > 1) stmt.src1 = insn.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER ? GetRegName(insn.operands[1].reg.value) : "0x" + ToHex(insn.operands[1].imm.value.u);
+                    stmt.dst = GetOpStr(0);
+                    stmt.src1 = GetOpStr(1);
                 }
                 else if (m == "lea") {
                     stmt.op = "LEA";
-                    stmt.dst = GetRegName(insn.operands[0].reg.value);
+                    stmt.dst = GetOpStr(0);
                     if (insn.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY && insn.operands[1].mem.base == ZYDIS_REGISTER_RIP) {
                         uint64_t target = insn.addr + insn.instr.length + insn.operands[1].mem.disp.value;
                         stmt.src1 = "STR_" + ToHex(target);
                     } else {
-                        stmt.src1 = "MEM";
+                        stmt.src1 = GetOpStr(1);
                     }
                 }
                 else if (m == "add" || m == "sub" || m == "xor" || m == "and" || m == "or" || m == "shl" || m == "shr" || m == "sar") {
                     stmt.op = "ALU";
-                    if (insn.instr.operand_count > 0) stmt.dst = GetRegName(insn.operands[0].reg.value);
-                    stmt.src1 = m; // 记录具体的操作符
-                    if (insn.instr.operand_count > 1) stmt.src2 = insn.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER ? GetRegName(insn.operands[1].reg.value) : "0x" + ToHex(insn.operands[1].imm.value.u);
+                    stmt.dst = GetOpStr(0);
+                    stmt.src1 = m; 
+                    stmt.src2 = GetOpStr(1);
+                }
+                else if (m == "inc" || m == "dec" || m == "neg" || m == "not") {
+                    stmt.op = "ALU";
+                    stmt.dst = GetOpStr(0);
+                    stmt.src1 = m;
+                    stmt.src2 = "1"; // 用于自增/自减占位
                 }
                 else if (m == "cmp" || m == "test") {
                     stmt.op = "CMP";
-                    if (insn.instr.operand_count > 0) stmt.dst = GetRegName(insn.operands[0].reg.value);
-                    if (insn.instr.operand_count > 1) stmt.src1 = insn.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER ? GetRegName(insn.operands[1].reg.value) : "0x" + ToHex(insn.operands[1].imm.value.u);
+                    stmt.dst = GetOpStr(0);
+                    stmt.src1 = (m == "test") ? "0" : GetOpStr(1);
                 }
                 else if (m == "call") {
                     stmt.op = "CALL";
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) stmt.src1 = "sub_" + ToHex(insn.operands[0].imm.value.u);
-                    else stmt.src1 = "API";
+                    else stmt.src1 = GetOpStr(0);
                 }
                 else if (m.rfind("j", 0) == 0) {
                     stmt.op = (m == "jmp") ? "JMP" : "CJMP";
@@ -307,12 +334,21 @@ private:
                 }
                 else if (m == "push") {
                     stmt.op = "PUSH";
+                    stmt.src1 = GetOpStr(0);
                 }
                 else if (m == "pop") {
                     stmt.op = "POP";
+                    stmt.dst = GetOpStr(0);
                 }
 
-                func.blocks.back().pcode.push_back(stmt);
+                // 只有成功转换为 P-Code 的指令才会被加入
+                if (stmt.op != "UNK") {
+                    func.blocks.back().pcode.push_back(stmt);
+                } else {
+                    // 如果是还没支持的指令，为了不污染代码，这里也不输出 UNK 节点了
+                    // 如果你想看它们，可以在这里加个输出
+                }
+
                 i++;
                 if (m == "ret") break;
             }
@@ -398,14 +434,18 @@ private:
                         if (it != m_strings.end()) ss << "    " << stmt.dst << " = (uint64_t)\"" << it->second << "\";\n";
                         else ss << "    " << stmt.dst << " = (uint64_t)&MEM(" << ToHex(addr - m_imageBase) << ");\n";
                     } else {
-                        ss << "    " << stmt.dst << " = (uint64_t)&MEM(...);\n";
+                        ss << "    " << stmt.dst << " = (uint64_t)&" << stmt.src1 << ";\n";
                     }
                 } else if (stmt.op == "ALU") {
-                    // 处理加、减、异或等运算
-                    std::string opStr = (stmt.src1 == "add") ? "+" : (stmt.src1 == "sub") ? "-" : (stmt.src1 == "xor") ? "^" : (stmt.src1 == "and") ? "&" : (stmt.src1 == "or") ? "|" : (stmt.src1 == "shl") ? "<<" : ">>";
-                    ss << "    " << stmt.dst << " " << opStr << "= " << stmt.src2 << ";\n";
+                    if (stmt.src1 == "inc") ss << "    " << stmt.dst << "++;\n";
+                    else if (stmt.src1 == "dec") ss << "    " << stmt.dst << "--;\n";
+                    else if (stmt.src1 == "neg") ss << "    " << stmt.dst << " = -" << stmt.dst << ";\n";
+                    else if (stmt.src1 == "not") ss << "    " << stmt.dst << " = ~" << stmt.dst << ";\n";
+                    else {
+                        std::string opStr = (stmt.src1 == "add") ? "+" : (stmt.src1 == "sub") ? "-" : (stmt.src1 == "xor") ? "^" : (stmt.src1 == "and") ? "&" : (stmt.src1 == "or") ? "|" : (stmt.src1 == "shl") ? "<<" : ">>";
+                        ss << "    " << stmt.dst << " " << opStr << "= " << stmt.src2 << ";\n";
+                    }
                 } else if (stmt.op == "CMP") {
-                    // 简化处理：记录比较的上下文
                     ss << "    // CMP " << stmt.dst << ", " << stmt.src1 << "\n";
                 } else if (stmt.op == "CALL") {
                     ss << "    " << stmt.src1 << "(rcx, rdx, r8, r9);\n";
@@ -414,12 +454,13 @@ private:
                     if (stmt.src1 == "jnz" || stmt.src1 == "jne") cond = "!=";
                     else if (stmt.src1 == "jg") cond = ">";
                     else if (stmt.src1 == "jl") cond = "<";
-                    // 这里为了保证生成代码可编译，简单用 rax 占位
                     ss << "    if (!(rax " << cond << " 0)) break;\n";
                 } else if (stmt.op == "RET") {
                     ss << "    return;\n";
-                } else if (stmt.op == "UNK") {
-                    ss << "    // Unmapped Instruction at 0x" << ToHex(stmt.addr) << "\n";
+                } else if (stmt.op == "PUSH") {
+                    ss << "    // push_stack(" << stmt.src1 << ");\n";
+                } else if (stmt.op == "POP") {
+                    ss << "    " << stmt.dst << " = pop_stack();\n";
                 }
             }
             if (block.isLoopHeader) ss << "    }\n";
