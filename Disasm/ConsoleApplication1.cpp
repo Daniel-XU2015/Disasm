@@ -158,11 +158,23 @@ public:
         }
     }
 
-    // 【修复】加入 entryPointVA 参数
     void AnalyzeAllFunctions(std::vector<Insn>& allInstructions, uint64_t imageBase, uint64_t entryPointVA) {
         m_imageBase = imageBase;
+        std::cout << "[DEBUG] Real Entry Point VA: 0x" << std::hex << entryPointVA << std::dec << "\n";
+        
         FindFunctions(allInstructions, entryPointVA);
         
+        std::cout << "[DEBUG] Total Functions Found: " << m_functions.size() << "\n";
+        bool found = false;
+        for (const auto& f : m_functions) {
+            if (f.name == "entry_point") {
+                std::cout << "[DEBUG] entry_point Found in m_functions. Size: " << f.blocks.size() << " blocks.\n";
+                found = true;
+                break;
+            }
+        }
+        if (!found) std::cout << "[DEBUG] WARNING: entry_point NOT Found in m_functions!\n";
+
         unsigned int numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4;
         std::atomic<size_t> currentIndex(0);
@@ -199,8 +211,12 @@ public:
         out << "uint8_t memory[0x100000];\n#define MEM(a) memory[(uint32_t)(a) & 0xFFFFF]\n\n";
 
         std::set<std::string> usedApis;
+        bool hasEntryPoint = false;
+
         for (const auto& func : m_functions) {
             if (!func.isDead) {
+                if (func.name == "entry_point") hasEntryPoint = true;
+                
                 std::string code = func.generatedCode;
                 size_t pos = 0;
                 while ((pos = code.find("api_", pos)) != std::string::npos) {
@@ -220,6 +236,13 @@ public:
 
         for (const auto& func : m_functions) {
             if (!func.isDead && !func.generatedCode.empty()) out << func.generatedCode << "\n";
+        }
+
+        // 【终极兜底】如果没生成 entry_point，手动补一个空的，防止链接报错
+        if (!hasEntryPoint) {
+            out << "void entry_point(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
+            out << "    // [WARNING] Fallback stub. Real entry_point was not generated.\n";
+            out << "}\n\n";
         }
 
         out << "int main() {\n    entry_point(0, 0, 0, 0);\n    return 0;\n}\n";
@@ -285,17 +308,11 @@ private:
         return s;
     }
 
-    // 【修复】强制将入口点加入函数列表，并设为非死代码
     void FindFunctions(std::vector<Insn>& allInstructions, uint64_t entryPointVA) {
         std::set<uint64_t> funcStarts;
         
-        // 强制插入真实的 PE 入口点
-        if (entryPointVA != 0) {
-            funcStarts.insert(entryPointVA);
-        }
-        if (!allInstructions.empty()) {
-            funcStarts.insert(allInstructions.front().addr);
-        }
+        if (entryPointVA != 0) funcStarts.insert(entryPointVA);
+        if (!allInstructions.empty()) funcStarts.insert(allInstructions.front().addr);
 
         for (auto& insn : allInstructions) {
             if (ZydisMnemonicGetString(insn.instr.mnemonic) == std::string("call") && insn.instr.operand_count > 0) {
@@ -311,10 +328,9 @@ private:
             Function func;
             func.startAddr = allInstructions[i].addr;
             
-            // 如果当前地址就是入口点，或者是对应调用的函数，才给名字，否则叫 sub_xxx
             if (func.startAddr == entryPointVA || (i == 0 && entryPointVA == 0)) {
                 func.name = "entry_point";
-                func.isDead = false; // 入口点绝对不能当作死代码丢弃
+                func.isDead = false;
             } else {
                 func.name = "sub_" + ToHex(func.startAddr);
                 func.isDead = true;
