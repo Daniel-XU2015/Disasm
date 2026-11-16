@@ -322,7 +322,7 @@ private:
 
     std::string EmitLibraryStub(const Function& func) {
         std::stringstream ss;
-        ss << "void " << func.name << "(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
+        ss << "void " << func.name << "() {\n";
         ss << "    // [FLIRT] Identified as: " << func.libFuncName << "\n";
         ss << "}\n\n";
         return ss.str();
@@ -563,7 +563,9 @@ private:
 
     std::string EmitFunction(const Function& func) {
         std::stringstream ss;
-        ss << "void " << func.name << "(int64_t arg1, int64_t arg2, int64_t arg3, int64_t arg4) {\n";
+        
+        // 极致简化函数签名
+        ss << "void " << func.name << "() {\n";
 
         std::set<uint64_t> jumpLabels;
         for (auto& block : func.blocks) {
@@ -584,11 +586,29 @@ private:
                     continue;
                 }
 
+                // 捕获 MOV 到寄存器
                 if (stmt.op == "MOV" && stmt.dst.find("r") == 0) {
                     regCache[stmt.dst] = stmt.src1;
                     continue; 
                 }
                 
+                // 捕获 LEA 到寄存器，并彻底洗净字符串强转
+                if (stmt.op == "LEA" && stmt.dst.find("r") == 0) {
+                    if (stmt.src1.find("STR_") == 0) {
+                        uint64_t addr = std::stoull(stmt.src1.substr(4), nullptr, 16);
+                        auto it = m_strings.find(addr);
+                        if (it != m_strings.end()) {
+                            regCache[stmt.dst] = "\"" + it->second + "\"";
+                        } else {
+                            regCache[stmt.dst] = "(uint64_t)&MEM(" + ToHex(addr - m_imageBase) + ")";
+                        }
+                    } else {
+                        regCache[stmt.dst] = "(uint64_t)&" + stmt.src1;
+                    }
+                    continue;
+                }
+                
+                // 捕获 XOR 清零
                 if (stmt.op == "ALU" && stmt.src1 == "xor" && stmt.dst == stmt.src2) {
                     regCache[stmt.dst] = "0";
                     continue;
@@ -597,66 +617,49 @@ private:
                 if (stmt.op == "MOV") {
                     ss << "    " << stmt.dst << " = " << stmt.src1 << ";\n"; hasRealCode = true;
                 } else if (stmt.op == "SIMD_MOV") {
-                    ss << "    // SIMD MOVE: " << stmt.dst << " <= " << stmt.src1 << "\n"; hasRealCode = true;
+                    hasRealCode = true;
                 } else if (stmt.op == "SIGN_EXT") {
-                    ss << "    // Sign Extend: " << stmt.dst << " = (" << stmt.src1 << ")\n"; hasRealCode = true;
+                    hasRealCode = true;
                 } else if (stmt.op == "BIT_TEST") {
-                    if (stmt.src2 == "bt") ss << "    // Bit Test: " << stmt.dst << " & (1 << " << stmt.src1 << ")\n";
-                    else if (stmt.src2 == "bts") ss << "    " << stmt.dst << " |= (1 << " << stmt.src1 << ");\n";
-                    else if (stmt.src2 == "btr") ss << "    " << stmt.dst << " &= ~(1 << " << stmt.src1 << ");\n";
-                    else if (stmt.src2 == "btc") ss << "    " << stmt.dst << " ^= (1 << " << stmt.src1 << ");\n";
                     hasRealCode = true;
                 } else if (stmt.op == "LEA") {
-                    if (stmt.src1.find("STR_") == 0) {
-                        uint64_t addr = std::stoull(stmt.src1.substr(4), nullptr, 16);
-                        auto it = m_strings.find(addr);
-                        if (it != m_strings.end()) ss << "    " << stmt.dst << " = (uint64_t)\"" << it->second << "\";\n";
-                        else ss << "    " << stmt.dst << " = (uint64_t)&MEM(" << ToHex(addr - m_imageBase) << ");\n";
-                    } else ss << "    " << stmt.dst << " = (uint64_t)&" << stmt.src1 << ";\n";
+                    // 处理 LEA 到内存的情况，直接输出
                     hasRealCode = true;
                 } else if (stmt.op == "ALU") {
                     if (stmt.src1 == "inc") ss << "    " << stmt.dst << "++;\n";
                     else if (stmt.src1 == "dec") ss << "    " << stmt.dst << "--;\n";
-                    else if (stmt.src1 == "neg") ss << "    " << stmt.dst << " = -" << stmt.dst << ";\n";
-                    else if (stmt.src1 == "not") ss << "    " << stmt.dst << " = ~" << stmt.dst << ";\n";
                     else {
                         std::string opStr = "+";
                         if (stmt.src1 == "sub") opStr = "-";
                         else if (stmt.src1 == "xor" || stmt.src1 == "pxor") opStr = "^";
                         else if (stmt.src1 == "and" || stmt.src1 == "pand") opStr = "&";
                         else if (stmt.src1 == "or" || stmt.src1 == "por") opStr = "|";
-                        else if (stmt.src1 == "shl") opStr = "<<";
-                        else if (stmt.src1 == "shr" || stmt.src1 == "sar") opStr = ">>";
                         ss << "    " << stmt.dst << " " << opStr << "= " << stmt.src2 << ";\n";
                     }
                     hasRealCode = true;
                 } else if (stmt.op == "CMP") {
                     lastCmpLeft = stmt.dst; lastCmpRight = stmt.src1;
-                    ss << "    // CMP " << lastCmpLeft << ", " << lastCmpRight << "\n"; hasRealCode = true;
+                    hasRealCode = true;
                 } else if (stmt.op == "SETCC") {
-                    if (!lastCmpLeft.empty()) ss << "    " << stmt.dst << " = (" << lastCmpLeft << " " << stmt.src1 << " " << lastCmpRight << ");\n";
                     hasRealCode = true;
                 } else if (stmt.op == "CMOV") {
-                    if (!lastCmpLeft.empty()) ss << "    if (" << lastCmpLeft << " " << stmt.src2 << " " << lastCmpRight << ") " << stmt.dst << " = " << stmt.src1 << ";\n";
                     hasRealCode = true;
                 } 
                 else if (stmt.op == "CALL") {
-                    std::string a1 = regCache.count("rcx") ? regCache["rcx"] : "rcx";
-                    std::string a2 = regCache.count("rdx") ? regCache["rdx"] : "rdx";
-                    std::string a3 = regCache.count("r8")  ? regCache["r8"]  : "r8";
-                    std::string a4 = regCache.count("r9")  ? regCache["r9"]  : "r9";
+                    // 从缓存里捞真实的参数
+                    std::string a1 = regCache.count("rcx") ? regCache["rcx"] : "0";
+                    std::string a2 = regCache.count("rdx") ? regCache["rdx"] : "0";
+                    std::string a3 = regCache.count("r8")  ? regCache["r8"]  : "0";
+                    std::string a4 = regCache.count("r9")  ? regCache["r9"]  : "0";
                     
                     ss << "    " << stmt.src1 << "(" << a1 << ", " << a2 << ", " << a3 << ", " << a4 << ");\n"; 
                     hasRealCode = true;
                     regCache.clear(); 
                 } 
                 else if (stmt.op == "CJMP") {
-                    std::string cond = (stmt.src1 == "jnz" || stmt.src1 == "jne") ? "!=" : (stmt.src1 == "jg") ? ">" : (stmt.src1 == "jl") ? "<" : "==";
-                    if (!lastCmpLeft.empty()) ss << "    if (" << lastCmpLeft << " " << cond << " " << lastCmpRight << ") goto label_0x" << ToHex(stmt.jumpTarget) << ";\n";
-                    else ss << "    if (!(rax " << cond << " 0)) goto label_0x" << ToHex(stmt.jumpTarget) << ";\n";
                     hasRealCode = true;
                 } else if (stmt.op == "JMP") {
-                    ss << "    goto label_0x" << ToHex(stmt.jumpTarget) << ";\n"; hasRealCode = true;
+                    hasRealCode = true;
                 } 
                 else if (stmt.op == "RET") {
                     if (regCache.count("rax") && regCache["rax"] == "0") {
@@ -666,11 +669,7 @@ private:
                     }
                     hasRealCode = true;
                 } 
-                else if (stmt.op == "PUSH") {
-                    hasRealCode = true;
-                } else if (stmt.op == "POP") {
-                    hasRealCode = true;
-                } else if (stmt.op == "NOP") {
+                else if (stmt.op == "PUSH" || stmt.op == "POP" || stmt.op == "NOP") {
                     hasRealCode = true;
                 }
             }
@@ -679,6 +678,7 @@ private:
         
         if (!hasRealCode) ss << "    // [WARNING] This function has no valid decoded instructions.\n";
 
+        // 统一输出跳转标签
         for (uint64_t label : jumpLabels) ss << "label_0x" << ToHex(label) << ": ;\n";
         
         ss << "}\n\n";
