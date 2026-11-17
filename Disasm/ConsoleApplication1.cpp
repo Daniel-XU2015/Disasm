@@ -709,6 +709,19 @@ static uint64_t CallIndirect(uint64_t target, uint64_t a1, uint64_t a2,
     return ((generic_pfn_t)target)(a1, a2, a3, a4);
 }
 static void UnknownInstruction(uint64_t address) { (void)address; }
+
+// 标志计算辅助：把冗长的 _l/_r/_t 临时变量收进函数，生成代码更接近手写风格。
+static inline void CMP(uint64_t a, uint64_t b) {
+    zflag = (a == b);
+    cflag = (a < b);
+    sflag = ((int64_t)a < (int64_t)b);
+}
+static inline void TESTF(uint64_t a, uint64_t b) {
+    uint64_t t = (a & b);
+    zflag = (t == 0);
+    cflag = 0;
+    sflag = ((int64_t)t < 0);
+}
 )API";
 
         if (!usedApis.empty()) {
@@ -739,12 +752,37 @@ static void UnknownInstruction(uint64_t address) { (void)address; }
             ctx.EmitAll();
         }
 
-        const std::string body = ss.str();
-        static const char* kRet = "    return rax.q;\n";
-        if (body.size() < std::strlen(kRet) ||
-            body.compare(body.size() - std::strlen(kRet), std::strlen(kRet), kRet) != 0)
-            ss << kRet;
-        ss << "}\n\n";
+        std::string body = ss.str();
+        ss.str(""); ss.clear();
+
+        // 精简返回值：若函数体最后一行是 `rax.q = EXPR;`，其后立即函数结束，
+        // 没有语句依赖 rax.q 的新值，可直接折叠成 `return EXPR;`（语义不变）。
+        const std::string pfx = "    rax.q = ";
+        size_t e = body.size();
+        if (e && body[e - 1] == '\n') --e;
+        const size_t lastNL = e ? body.rfind('\n', e - 1) : std::string::npos;
+        const size_t lineStart = (lastNL == std::string::npos) ? 0 : lastNL + 1;
+        const std::string lastLine = body.substr(lineStart, e - lineStart);
+        if (lastLine.rfind(pfx, 0) == 0 && lastLine.size() > pfx.size() &&
+            lastLine.back() == ';') {
+            const std::string expr = lastLine.substr(pfx.size(),
+                                                     lastLine.size() - pfx.size() - 1);
+            if (!expr.empty())
+                body.replace(lineStart, e - lineStart, "    return " + expr + ";");
+        }
+
+        // 若末尾还没有任何 return（可能在控制流分支里 return 过），补一个。
+        e = body.size();
+        if (e && body[e - 1] == '\n') --e;
+        const size_t nl2 = e ? body.rfind('\n', e - 1) : std::string::npos;
+        const size_t ls2 = (nl2 == std::string::npos) ? 0 : nl2 + 1;
+        const std::string tail = body.substr(ls2, e - ls2);
+        if (tail.rfind("    return ", 0) != 0)
+            body += "    return rax.q;\n";
+        else if (!body.empty() && body.back() != '\n')
+            body += "\n";
+
+        ss << body << "}\n\n";
         return ss.str();
     }
 
@@ -1060,6 +1098,20 @@ public:
             s.dst.rfind("MEM(", 0) == 0 && ByteRegs.count(s.src2))
             return;
 
+        // 精简：push/pop 在生成代码里只是注释（栈深由下面的 sub/add rsp 模拟），
+        // 对可读的 C 伪代码无意义，直接去掉。
+        if (s.op == "PUSH" || s.op == "POP") return;
+
+        // 精简：成对的 sub/add rsp, imm 是编译器栈帧调整（prologue/epilogue），
+        // 不承载业务逻辑，去掉后更接近手写源码。只过滤常量操作数，避免误伤
+        // 以 rsp 为基址的真实栈变量访问（那些是 MEM(rsp.q+off) 形式，dst 不是 rsp）。
+        auto IsImm = [](const std::string& x) {
+            return x.size() > 2 && x[0] == '0' && (x[1] == 'x' || x[1] == 'X');
+        };
+        if (s.op == "ALU" && s.dst == "rsp" &&
+            (s.src1 == "sub" || s.src1 == "add") && IsImm(s.src2))
+            return;
+
         auto Opnd = [strings](const std::string& x) -> std::string {
             static const std::set<std::string> Q = {
                 "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
@@ -1153,17 +1205,11 @@ public:
                 out << "    " << d << " " << o << " " << v << ";\n";
             }
         }
-        else if (s.op == "CMP") {
-            // cmp a,b 计算 a-b：CF = 无符号借位，SF ≈ 有符号小于，ZF = 相等。
-            out << "    { uint64_t _l = " << Opnd(s.dst) << "; uint64_t _r = " << Opnd(s.src1)
-                << "; zflag = (_l == _r); cflag = (_l < _r); "
-                << "sflag = ((int64_t)_l < (int64_t)_r); }\n";
-        }
-        else if (s.op == "TEST") {
-            // TEST 执行按位与并清 CF/OF，只按结果设置 ZF/SF。
-            out << "    { uint64_t _t = (" << Opnd(s.dst) << " & " << Opnd(s.src1)
-                << "); zflag = (_t == 0); cflag = 0; sflag = ((int64_t)_t < 0); }\n";
-        }
+        else if (s.op == "CMP")
+            // cmp a,b 的 ZF/CF/SF 计算收进 preamble 的 CMP() 辅助函数。
+            out << "    CMP(" << Opnd(s.dst) << ", " << Opnd(s.src1) << ");\n";
+        else if (s.op == "TEST")
+            out << "    TESTF(" << Opnd(s.dst) << ", " << Opnd(s.src1) << ");\n";
         else if (s.op == "CALL") {
             if (s.src1.rfind("api_", 0) == 0) {
                 const std::string name = s.src1.substr(4);
