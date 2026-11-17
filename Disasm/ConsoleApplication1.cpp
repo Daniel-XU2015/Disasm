@@ -77,15 +77,29 @@ public:
         while (desc->Name) {
             const auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(
                 RvaToOff(fileData, fileSize, nt, desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk));
+            uint32_t thunkRva = desc->OriginalFirstThunk ? desc->OriginalFirstThunk : desc->FirstThunk;
+            const uint8_t* thunkBytes = RvaToOff(fileData, fileSize, nt, thunkRva);
+            if (!thunkBytes) { ++desc; continue; }
             uint64_t iat = imageBase + desc->FirstThunk;
             while (thunk && thunk->u1.AddressOfData) {
                 if (!(thunk->u1.Ordinal & IMAGE_ORDINAL_FLAG64)) {
+            bool is64 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+            for (size_t k = 0;; ++k) {
+                uint64_t entry = is64
+                    ? reinterpret_cast<const IMAGE_THUNK_DATA64*>(thunkBytes)[k].u1.AddressOfData
+                    : reinterpret_cast<const IMAGE_THUNK_DATA32*>(thunkBytes)[k].u1.AddressOfData;
+                if (!entry) break;
+                uint64_t ordinalFlag = is64 ? IMAGE_ORDINAL_FLAG64 : IMAGE_ORDINAL_FLAG32;
+                if (!(entry & ordinalFlag)) {
                     const auto* ibn = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
                         RvaToOff(fileData, fileSize, nt, thunk->u1.AddressOfData));
                     if (ibn) m_iat[iat] = std::string(ibn->Name);
+                        RvaToOff(fileData, fileSize, nt, static_cast<uint32_t>(entry)));
+                    if (ibn) m_iat[iat] = std::string(reinterpret_cast<const char*>(ibn->Name));
                 }
                 iat += (nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) ? 4 : 8;
                 thunk++;
+                iat += is64 ? 8 : 4;
             }
             desc++;
         }
@@ -226,6 +240,13 @@ public:
 class DynamicApiResolver {
 public:
     void Analyze(Function& func, const std::unordered_map<uint64_t, std::string>& strings) const {
+        auto resolveString = [&](const std::string& v) -> std::string {
+            if (v.rfind("STR_", 0) != 0) return "";
+            uint64_t a = strtoull(v.c_str() + 4, nullptr, 16);
+            auto it = strings.find(a);
+            return it != strings.end() ? it->second : "";
+        };
+
         for (auto& blk : func.blocks) {
             std::string pendingStr;
             for (size_t i = 0; i < blk.pcode.size(); ++i) {
@@ -234,19 +255,57 @@ public:
                     uint64_t a = strtoull(s.src1.substr(4).c_str(), nullptr, 16);
                     auto it = strings.find(a);
                     if (it != strings.end()) pendingStr = it->second;
-                }
+
+                if ((s.op == "LEA" || s.op == "MOV") && !s.src1.empty()) {
+                    std::string resolved = resolveString(s.src1);
+                    if (!resolved.empty()) {
+                        pendingStr = resolved;
+                        continue;
+                    }
                 if (s.op == "CALL" && s.src1.find("GetProcAddress") != std::string::npos
                     && !pendingStr.empty()) {
                     for (size_t j = i + 1; j < blk.pcode.size() && j < i + 5; ++j) {
-                        auto& n = blk.pcode[j];
+                }
+
+                if (s.op == "CALL") {
+                    std::string callee = s.src1;
+                    if (callee.find("GetProcAddress") != std::string::npos ||
+                        callee.find("LdrGetProcedureAddress") != std::string::npos) {
+                        if (!pendingStr.empty()) {
+                            for (size_t j = i + 1; j < blk.pcode.size() && j < i + 6; ++j) {
+                                auto& n = blk.pcode[j];
                         if (n.op == "CALL" && (n.src1 == "rax" || n.src1 == "rcx" ||
                             n.src1 == "rdx" || n.src1 == "r8" ||
                             n.src1 == "r9")) {
-                            n.src1 = "api_" + pendingStr;
-                            break;
+                                if (n.op == "CALL" &&
+                                    (n.src1 == "rax" || n.src1 == "rcx" || n.src1 == "rdx" ||
+                                     n.src1 == "r8"  || n.src1 == "r9" || n.src1 == "qword ptr [rax]")) {
+                                    n.src1 = "api_" + pendingStr;
+                                    break;
+                                }
+                            }
                         }
+                        pendingStr.clear();
+                        continue;
                     }
-                    pendingStr.clear();
+
+                    if ((callee.find("LoadLibrary") != std::string::npos ||
+                         callee.find("LoadLibraryEx") != std::string::npos ||
+                         callee.find("GetModuleHandle") != std::string::npos) &&
+                        !pendingStr.empty()) {
+                        s.src1 = "api_" + pendingStr;
+                        pendingStr.clear();
+                        continue;
+                    }
+
+                    if (!pendingStr.empty() &&
+                        (s.src1 == "rax" || s.src1 == "rcx" || s.src1 == "rdx" ||
+                         s.src1 == "r8"  || s.src1 == "r9")) {
+                        s.src1 = "api_" + pendingStr;
+                        pendingStr.clear();
+                    }
+
+                    if (!pendingStr.empty()) pendingStr.clear();
                 }
             }
         }
@@ -298,9 +357,17 @@ private:
             auto& last = b.pcode.back();
             auto link = [&](int t) {
                 if (t < 0 || t >= (int)func.blocks.size()) return;
+                if (t == b.id) return;
+                for (int x : b.successors) if (x == t) return;
                 b.successors.push_back(t);
                 func.blocks[t].predecessors.push_back(b.id);
-                };
+            };
+            auto fallthrough = [&]() {
+                if (b.id + 1 >= (int)func.blocks.size()) return;
+                auto& nextBlk = func.blocks[b.id + 1];
+                if (nextBlk.startAddr <= b.endAddr) return;
+                link(b.id + 1);
+            };
             if (last.op == "JMP" && last.jumpTarget) {
                 auto it = id.find(last.jumpTarget);
                 if (it != id.end()) link(it->second);
@@ -309,8 +376,10 @@ private:
                 auto it = id.find(last.jumpTarget);
                 if (it != id.end()) link(it->second);
                 link(b.id + 1);
+                fallthrough();
             }
             else if (last.op != "RET") link(b.id + 1);
+            else if (last.op != "RET") fallthrough();
         }
     }
     // 修复 Bug#2: CHK 算法
@@ -354,6 +423,7 @@ private:
     // 修复 Bug#3: 循环检测加终止条件
     static void Loops(Function& func) {
         for (auto& blk : func.blocks) for (int s : blk.successors) {
+            if (s < 0 || s >= (int)func.blocks.size()) continue;
             int c = blk.id; bool back = false;
             std::set<int> seen;
             while (c >= 0 && !seen.count(c)) {
@@ -369,6 +439,7 @@ private:
             std::vector<int> stk{ blk.id };
             while (!stk.empty()) {
                 int x = stk.back(); stk.pop_back();
+                if (x < 0 || x >= (int)func.blocks.size()) continue;
                 if (!body.count(x)) {
                     body.insert(x);
                     for (int p : func.blocks[x].predecessors)
@@ -390,6 +461,7 @@ public:
         out << "#include <windows.h>\n#include <stdint.h>\n#include <stdio.h>\n#include <string.h>\n";
         out << "#pragma warning(disable: 4100 4189 4244 4245 4267 4311 4312 4700)\n\n";
         out << R"REG(
+typedef uintptr_t u64p;
 typedef union { uint64_t q; uint32_t d; uint16_t w; struct { uint8_t l, h; }; } reg64_t;
 static reg64_t rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15;
 static int zflag = 0, sflag = 0;
@@ -424,11 +496,23 @@ static int zflag = 0, sflag = 0;
 #define r9w  r9.w
 #define r9b  r9.l
 #define r10d r10.d
+#define r10w r10.w
+#define r10b r10.l
 #define r11d r11.d
+#define r11w r11.w
+#define r11b r11.l
 #define r12d r12.d
+#define r12w r12.w
+#define r12b r12.l
 #define r13d r13.d
+#define r13w r13.w
+#define r13b r13.l
 #define r14d r14.d
+#define r14w r14.w
+#define r14b r14.l
 #define r15d r15.d
+#define r15w r15.w
+#define r15b r15.l
 )REG";
         out << "\n#define MEM_POOL_SIZE (1u << 24)\nstatic uint8_t g_mem[MEM_POOL_SIZE];\n";
         out << "#define GA(p)   (g_mem + ((uint32_t)(p) & (MEM_POOL_SIZE-1)))\n";
@@ -444,11 +528,18 @@ static uint64_t ResolveApi(const char* name) {
     static HMODULE hN = GetModuleHandleA("ntdll.dll");
     static HMODULE hU = LoadLibraryA("user32.dll");
     static HMODULE hA = LoadLibraryA("advapi32.dll");
+    static HMODULE hK = NULL;
+    static HMODULE hN = NULL;
+    static HMODULE hU = NULL;
+    static HMODULE hA = NULL;
     static const struct { const char* mod; HMODULE* h; } D[] = {
         {"kernel32.dll",&hK},{"ntdll.dll",&hN},{"user32.dll",&hU},{"advapi32.dll",&hA} };
     for (auto& d : D) {
         HMODULE h = *d.h;
         if (!h) h = LoadLibraryA(d.mod);
+    for (size_t i = 0; i < sizeof(D) / sizeof(D[0]); ++i) {
+        HMODULE h = *D[i].h;
+        if (!h) h = LoadLibraryA(D[i].mod);
         if (!h) continue;
         FARPROC p = GetProcAddress(h, name);
         if (p) return (uint64_t)p;
@@ -461,6 +552,16 @@ static uint64_t ResolveApi(const char* name) {
          if (_p) rax.q = ((generic_pfn_t)_p)((uint64_t)(a1),(uint64_t)(a2),(uint64_t)(a3),(uint64_t)(a4)); \
     } while (0)
 )API";
+        out << R"CALL(
+static uint64_t CallIndirect(uint64_t target, uint64_t a1, uint64_t a2,
+                             uint64_t a3, uint64_t a4) {
+    if (!target) return 0;
+    return ((generic_pfn_t)target)(a1, a2, a3, a4);
+}
+static void UnknownInstruction(uint64_t address) {
+    (void)address;
+}
+)CALL";
         if (!usedApis.empty()) {
             out << "\n// APIs referenced:\n";
             for (auto& a : usedApis) out << "//   " << a << "\n";
@@ -471,6 +572,9 @@ static uint64_t ResolveApi(const char* name) {
     std::string Emit(Function& func, XrefDB& xref, const TypeRecovery& types) {
         std::stringstream ss;
         ss << "uint64_t " << func.name << "(void) {\n";
+        ss << "uint64_t " << func.name
+            << "(uint64_t _a1, uint64_t _a2, uint64_t _a3, uint64_t _a4) {\n"
+            << "    rcx.q = _a1; rdx.q = _a2; r8.q = _a3; r9.q = _a4;\n";
         if (CanStructure(func)) {
             StructCtx ctx{ func, xref, types, ss };
             ctx.EmitRegion(0, -1, -1);
@@ -657,6 +761,8 @@ private:
             : func(f), xref(x), types(t), out(o) {
         }
         void EmitAll() {
+            std::set<uint64_t> labels;
+            for (auto& b : func.blocks) labels.insert(b.startAddr);
             for (auto& blk : func.blocks) {
                 out << "L" << XrefDB::Hex(blk.startAddr) << ": ;\n";
                 for (auto& s : blk.pcode) EmitOneStmt(s, out, xref, types);
@@ -664,10 +770,16 @@ private:
                 auto& last = blk.pcode.back();
                 if (last.op == "RET") out << "    return rax.q;\n";
                 else if (last.op == "JMP" && last.jumpTarget)
-                    out << "    goto L" << XrefDB::Hex(last.jumpTarget) << ";\n";
+                else if (last.op == "JMP" && last.jumpTarget) {
+                    if (labels.count(last.jumpTarget))
+                        out << "    goto L" << XrefDB::Hex(last.jumpTarget) << ";\n";
                 else if (last.op == "CJMP" && last.jumpTarget)
-                    out << "    if (" << CondOf(last.src1) << ") goto L"
-                    << XrefDB::Hex(last.jumpTarget) << ";\n";
+                }
+                else if (last.op == "CJMP" && last.jumpTarget) {
+                    if (labels.count(last.jumpTarget))
+                        out << "    if (" << CondOf(last.src1) << ") goto L"
+                            << XrefDB::Hex(last.jumpTarget) << ";\n";
+                }
             }
         }
     };
@@ -681,6 +793,7 @@ public:
             if (x.compare(0, 4, "MEM(") == 0) return "MEM(" + x.substr(4);
             if (x.compare(0, 4, "STR_") == 0) return "0";
             static const std::set<std::string> R = {
+            static const std::set<std::string> R64 = {
                 "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
                 "r8","r9","r10","r11","r12","r13","r14","r15",
                 "eax","ebx","ecx","edx","esi","edi","ebp","esp",
@@ -688,6 +801,8 @@ public:
                 "r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d",
                 "r8w","r9w","r8b","r9b","ax","bx","cx","dx","si","di","bp","sp" };
             if (R.count(x)) return x + ".q";
+                "r8","r9","r10","r11","r12","r13","r14","r15" };
+            if (R64.count(x)) return x + ".q";
             return x;
             };
         if (s.op == "MOV") {
@@ -704,9 +819,36 @@ public:
             else if (s.src1 == "xor" || s.src1 == "pxor") o = "^=";
             else if (s.src1 == "and" || s.src1 == "pand") o = "&=";
             else if (s.src1 == "or" || s.src1 == "por")  o = "|=";
-            out << "    " << Opnd(s.dst) << " " << o << " " << Opnd(s.src2) << ";\n";
+            if (s.src1 == "inc")
+                out << "    " << Opnd(s.dst) << "++;\n";
+            else if (s.src1 == "dec")
+                out << "    " << Opnd(s.dst) << "--;\n";
+            else if (s.src1 == "neg")
+                out << "    " << Opnd(s.dst) << " = (uint64_t)(-(int64_t)" << Opnd(s.dst) << ");\n";
+            else if (s.src1 == "not")
+                out << "    " << Opnd(s.dst) << " = ~" << Opnd(s.dst) << ";\n";
+            else if (s.src1 == "shl")
+                out << "    " << Opnd(s.dst) << " <<= " << Opnd(s.src2) << ";\n";
+            else if (s.src1 == "shr")
+                out << "    " << Opnd(s.dst) << " >>= " << Opnd(s.src2) << ";\n";
+            else if (s.src1 == "sar")
+                out << "    " << Opnd(s.dst) << " = (uint64_t)((int64_t)" << Opnd(s.dst)
+                    << " >> " << Opnd(s.src2) << ");\n";
+            else
+                out << "    " << Opnd(s.dst) << " " << o << " " << Opnd(s.src2) << ";\n";
         }
         else if (s.op == "CMP") out << "    zflag = (" << Opnd(s.dst) << " == " << Opnd(s.src1) << ");\n";
+        else if (s.op == "CMP") {
+            out << "    { uint64_t _cmp_l = " << Opnd(s.dst)
+                << "; uint64_t _cmp_r = " << Opnd(s.src1)
+                << "; zflag = (_cmp_l == _cmp_r);"
+                << " sflag = ((int64_t)_cmp_l < (int64_t)_cmp_r); }\n";
+        }
+        else if (s.op == "TEST") {
+            out << "    { uint64_t _test = (" << Opnd(s.dst) << " & "
+                << Opnd(s.src1) << "); zflag = (_test == 0);"
+                << " sflag = ((int64_t)_test < 0); }\n";
+        }
         else if (s.op == "CALL") {
             if (s.src1.compare(0, 4, "api_") == 0) {
                 std::string name = s.src1.substr(4);
@@ -716,8 +858,19 @@ public:
             else if (s.src1.compare(0, 5, "func_") == 0) {
                 out << "    rax.q = " << s.src1 << "();\n";
                 xref.Add({ s.addr, strtoull(s.src1.c_str() + 5, nullptr, 16), Xref::CALL_FUNC, s.src1 });
+            else if (s.src2 == "DIRECT_FUNC" || s.src1.compare(0, 5, "func_") == 0) {
+                out << "    rax.q = " << s.src1
+                    << "(rcx.q, rdx.q, r8.q, r9.q);\n";
+                uint64_t target = s.src1.compare(0, 5, "func_") == 0
+                    ? strtoull(s.src1.c_str() + 5, nullptr, 16) : 0;
+                xref.Add({ s.addr, target, Xref::CALL_FUNC, s.src1 });
             }
             else out << "    // [INDIRECT CALL] " << s.src1 << "\n";
+            else {
+                out << "    rax.q = CallIndirect((uint64_t)(" << s.src1
+                    << "), rcx.q, rdx.q, r8.q, r9.q);\n";
+                xref.Add({ s.addr, 0, Xref::CALL_FUNC, "indirect" });
+            }
         }
         else if (s.op == "LEA") out << "    " << Opnd(s.dst) << " = " << Opnd(s.src1) << ";\n";
         else if (s.op == "PUSH")  out << "    // push " << s.src1 << "\n";
@@ -762,6 +915,15 @@ public:
         m_imageBase = imageBase;
         FindFunctions(allInsns, entryVA);
 
+        std::set<uint64_t> knownFunctions;
+        for (auto& f : m_functions) knownFunctions.insert(f.startAddr);
+        for (auto& f : m_functions) for (auto& b : f.blocks) for (auto& s : b.pcode) {
+            if (s.op != "CALL" || s.src1.compare(0, 5, "func_") != 0) continue;
+            uint64_t target = strtoull(s.src1.c_str() + 5, nullptr, 16);
+            if (!knownFunctions.count(target)) s.src1 = "0";
+        }
+        RenameFunctions();
+
         unsigned int nT = std::thread::hardware_concurrency();
         if (!nT) nT = 4;
         std::atomic<size_t> idx(0);
@@ -780,7 +942,7 @@ public:
                     flow.Run(f);
                     dyn.Analyze(f, m_strings);
                 }
-                });
+            });
         }
         for (auto& t : pool) t.join();
 
@@ -811,11 +973,18 @@ public:
             for (auto& f : m_functions)
                 if (!f.isDead && !f.isLibraryFunc)
                     out << "uint64_t " << f.name << "(void);\n";
+                if (!f.isDead)
+                    out << "uint64_t " << f.name
+                        << "(uint64_t, uint64_t, uint64_t, uint64_t);\n";
             out << "\n";
             for (auto& f : m_functions)
                 if (!f.isDead && !f.isLibraryFunc && !f.generatedCode.empty())
+                if (!f.isDead && !f.generatedCode.empty())
                     out << f.generatedCode;
             out << "int main(void) {\n    entry_point();\n    return 0;\n}\n";
+            out << "int main(int argc, char** argv) {\n"
+                << "    entry_point((uint64_t)argc, (uint64_t)argv, 0, 0);\n"
+                << "    return 0;\n}\n";
         }
         else {
             out << "\xEF\xBB\xBF#include <stdint.h>\n#include <windows.h>\n#include <string.h>\n\n";
@@ -837,6 +1006,51 @@ public:
         }
     }
 
+    static std::string SafeName(std::string name) {
+        for (char& c : name) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_')) c = '_';
+        }
+        if (name.empty() || (name[0] >= '0' && name[0] <= '9')) name = "fn_" + name;
+        return name;
+    }
+
+    void RenameFunctions() {
+        std::unordered_map<std::string, std::string> oldToNew;
+        std::unordered_map<std::string, int> nameUse;
+        std::set<std::string> reserved{"entry_point"};
+        for (auto& f : m_functions) {
+            if (f.name == "entry_point") continue;
+            std::map<std::string, int> apiCount;
+            for (auto& b : f.blocks) for (auto& s : b.pcode)
+                if (s.op == "CALL" && s.src1.rfind("api_", 0) == 0)
+                    ++apiCount[s.src1.substr(4)];
+            std::string base;
+            if (!apiCount.empty()) {
+                auto best = std::max_element(apiCount.begin(), apiCount.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; });
+                base = SafeName(best->first) + "_wrapper";
+            }
+            if (base.empty()) base = "sub_" + ToHex(f.startAddr);
+            std::string old = f.name;
+            std::string candidate = base;
+            if (++nameUse[base] > 1 || reserved.count(candidate))
+                candidate = base + "_" + ToHex(f.startAddr);
+            while (reserved.count(candidate)) candidate += "_fn";
+            reserved.insert(candidate);
+            oldToNew[old] = candidate;
+            f.name = candidate;
+        }
+        for (auto& f : m_functions) for (auto& b : f.blocks) for (auto& s : b.pcode) {
+            if (s.op != "CALL" || s.src1.compare(0, 5, "func_") != 0) continue;
+            auto it = oldToNew.find(s.src1);
+            if (it != oldToNew.end()) {
+                s.src1 = it->second;
+                s.src2 = "DIRECT_FUNC";
+            }
+        }
+    }
+
 private:
     uint64_t m_imageBase = 0;
     ApiResolver* m_apiResolver;
@@ -845,6 +1059,13 @@ private:
     std::unordered_map<uint64_t, std::string> m_strings;
     std::set<uint64_t> m_calledFuncs;
     XrefDB m_xref;
+
+    static uint64_t ImmediateTarget(const Insn& insn, const ZydisDecodedOperand& op) {
+        if (op.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return 0;
+        if (op.imm.is_relative)
+            return insn.addr + insn.instr.length + static_cast<int64_t>(op.imm.value.s);
+        return op.imm.value.u;
+    }
 
     std::string ToHex(uint64_t v) { std::stringstream ss; ss << std::hex << v; return ss.str(); }
 
@@ -876,11 +1097,16 @@ private:
     std::string EmitLibraryStub(const Function& f) {
         std::stringstream ss;
         ss << "uint64_t " << f.name << "(void) {\n    // [FLIRT] " << f.libFuncName << "\n    return 0;\n}\n\n";
+        ss << "uint64_t " << f.name
+           << "(uint64_t _a1, uint64_t _a2, uint64_t _a3, uint64_t _a4) {\n    // [FLIRT] "
+           << f.libFuncName << "\n    return 0;\n}\n\n";
         return ss.str();
     }
 
     void FindFunctions(std::vector<Insn>& allInsns, uint64_t entryVA) {
         std::set<uint64_t> starts;
+        std::set<uint64_t> instructionAddresses;
+        for (auto& insn : allInsns) instructionAddresses.insert(insn.addr);
         uint64_t actualEntry = entryVA;
         bool found = false;
         if (!allInsns.empty()) {
@@ -893,6 +1119,11 @@ private:
                 i.instr.operand_count > 0 && i.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                 starts.insert(i.operands[0].imm.value.u);
                 m_calledFuncs.insert(i.operands[0].imm.value.u);
+                uint64_t target = ImmediateTarget(i, i.operands[0]);
+                if (instructionAddresses.count(target)) {
+                    starts.insert(target);
+                    m_calledFuncs.insert(target);
+                }
             }
         size_t i = 0;
         bool assigned = false;
@@ -929,6 +1160,20 @@ private:
                         if (op.mem.base != ZYDIS_REGISTER_NONE) r += GetRegName(op.mem.base);
                         if (op.mem.disp.value != 0)
                             r += (op.mem.disp.value > 0 ? "+" : "") + std::to_string(op.mem.disp.value);
+                        if (op.mem.base == ZYDIS_REGISTER_RIP) {
+                            uint64_t target = insn.addr + insn.instr.length + op.mem.disp.value;
+                            r += "0x" + ToHex(target);
+                        }
+                        else if (op.mem.base != ZYDIS_REGISTER_NONE) r += GetRegName(op.mem.base) + ".q";
+                        if (op.mem.index != ZYDIS_REGISTER_NONE) {
+                            if (op.mem.base != ZYDIS_REGISTER_NONE && op.mem.base != ZYDIS_REGISTER_RIP) r += "+";
+                            r += GetRegName(op.mem.index) + ".q";
+                            if (op.mem.scale > 1) r += "*" + std::to_string(op.mem.scale);
+                        }
+                        if (op.mem.disp.value != 0 && op.mem.base != ZYDIS_REGISTER_RIP)
+                            r += (op.mem.base != ZYDIS_REGISTER_NONE || op.mem.index != ZYDIS_REGISTER_NONE)
+                                ? (op.mem.disp.value > 0 ? "+" : "") + std::to_string(op.mem.disp.value)
+                                : std::to_string(op.mem.disp.value);
                         r += ")";
                         return r;
                     }
@@ -965,6 +1210,7 @@ private:
                 }
                 else if (m == "cmp") { s.op = "CMP"; s.dst = GetOp(0); s.src1 = GetOp(1); }
                 else if (m == "test") { s.op = "CMP"; s.dst = GetOp(0); s.src1 = "0"; }
+                else if (m == "test") { s.op = "TEST"; s.dst = GetOp(0); s.src1 = GetOp(1); }
                 else if (m == "cmovz" || m == "cmove" || m == "cmovnz" || m == "cmovne" || m == "cmovl" || m == "cmovg") {
                     s.op = "CMOV"; s.dst = GetOp(0); s.src1 = GetOp(1); s.src2 = m;
                 }
@@ -998,17 +1244,21 @@ private:
                     s.op = "JMP";
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
                         s.jumpTarget = insn.operands[0].imm.value.u;
+                        s.jumpTarget = ImmediateTarget(insn, insn.operands[0]);
                 }
                 else if (m.rfind("j", 0) == 0) {
                     s.op = "CJMP"; s.src1 = m;
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
                         s.jumpTarget = insn.operands[0].imm.value.u;
+                        s.jumpTarget = ImmediateTarget(insn, insn.operands[0]);
                 }
                 else if (m == "ret") s.op = "RET";
                 else if (m == "push") { s.op = "PUSH"; s.src1 = GetOp(0); }
                 else if (m == "pop") { s.op = "POP"; s.dst = GetOp(0); }
 
                 if (s.op != "UNK") f.blocks.back().pcode.push_back(s);
+                if (s.op == "UNK") s.op = "UNKNOWN";
+                f.blocks.back().pcode.push_back(s);
                 i++;
                 if (m == "ret") break;
             }
@@ -1058,6 +1308,12 @@ private:
                 if (s.op == "ALU" && s.src1 == "xor" && s.dst == s.src2) { rc[s.dst] = "0"; continue; }
 
                 if (s.op == "MOV") { Emit("    " + s.dst + " = " + s.src1 + ";\n"); hasCode = true; }
+                if (s.op == "MOV") {
+                    std::string lhs = s.dst;
+                    if (lhs.find("MEM(") == 0) lhs = "MEM" + lhs.substr(3);
+                    Emit("    " + lhs + " = " + s.src1 + ";\n");
+                    hasCode = true;
+                }
                 else if (s.op == "ALU") {
                     if (s.src1 == "inc") Emit("    " + s.dst + "++;\n");
                     else if (s.src1 == "dec") Emit("    " + s.dst + "--;\n");
@@ -1067,17 +1323,23 @@ private:
                         else if (s.src1 == "xor" || s.src1 == "pxor") o = "^";
                         else if (s.src1 == "and") o = "&";
                         else if (s.src1 == "or") o = "|";
+                        else if (s.src1 == "and" || s.src1 == "pand") o = "&";
+                        else if (s.src1 == "or" || s.src1 == "por") o = "|";
                         Emit("    " + s.dst + " " + o + "= " + s.src2 + ";\n");
                     }
                     hasCode = true;
                 }
                 else if (s.op == "CMP") { hasCode = true; }
                 else if (s.op == "CALL") {
-                    std::string a1 = rc.count("rcx") ? rc["rcx"] : "0";
-                    std::string a2 = rc.count("rdx") ? rc["rdx"] : "0";
-                    std::string a3 = rc.count("r8") ? rc["r8"] : "0";
-                    std::string a4 = rc.count("r9") ? rc["r9"] : "0";
-                    Emit("    " + s.src1 + "(" + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ");\n");
+                    if (s.src1.rfind("api_", 0) == 0) {
+                        Emit("    rax.q = ResolveApi(\"" + s.src1.substr(4) + "\");\n");
+                    } else {
+                        std::string a1 = rc.count("rcx") ? rc["rcx"] : "0";
+                        std::string a2 = rc.count("rdx") ? rc["rdx"] : "0";
+                        std::string a3 = rc.count("r8") ? rc["r8"] : "0";
+                        std::string a4 = rc.count("r9") ? rc["r9"] : "0";
+                        Emit("    " + s.src1 + "(" + a1 + ", " + a2 + ", " + a3 + ", " + a4 + ");\n");
+                    }
                     hasCode = true; rc.clear();
                 }
                 else if (s.op == "RET") { Emit("    return;\n"); hasCode = true; }
@@ -1101,14 +1363,31 @@ private:
 int main(int argc, char* argv[]) {
     std::cout << "--- Disasm Engine Started ---\n";
     std::string in, out, emit = "compilable";
+    auto printHelp = []() {
+        std::cout
+            << "Usage:\n"
+            << "  Disasm -f <input.exe> -c <output.c> [--emit analysis|compilable]\n\n"
+            << "Options:\n"
+            << "  -f <file>       Input PE/EXE file\n"
+            << "  -c <file>       Generated C output file\n"
+            << "  --emit <mode>   analysis or compilable (default: compilable)\n"
+            << "  -h, -help, --help\n"
+            << "                  Show this help message\n";
+    };
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-f" && i + 1 < argc) in = argv[++i];
+        if (a == "-h" || a == "-help" || a == "--help" || a == "-hlep") {
+            printHelp();
+            return 0;
+        }
+        else if (a == "-f" && i + 1 < argc) in = argv[++i];
         else if (a == "-c" && i + 1 < argc) out = argv[++i];
         else if (a == "--emit" && i + 1 < argc) emit = argv[++i];
     }
     if (in.empty() || out.empty()) {
         std::cerr << "Usage: Disasm -f <in.exe> -c <out.c> [--emit analysis|compilable]\n";
+        printHelp();
         return 1;
     }
 
