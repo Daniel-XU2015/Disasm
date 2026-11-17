@@ -708,6 +708,11 @@ private:
         return "zflag";
     }
 
+    static bool SameStmt(const PCodeStmt& a, const PCodeStmt& b) {
+        return a.op == b.op && a.dst == b.dst && a.src1 == b.src1 &&
+               a.src2 == b.src2 && a.jumpTarget == b.jumpTarget;
+    }
+
     struct StructCtx {
         const Function& func;
         XrefDB& xref;
@@ -742,11 +747,15 @@ private:
         }
 
         void EmitBody(const BasicBlock& blk, bool skipCtrl) {
+            const PCodeStmt* prev = nullptr;
             for (size_t i = 0; i < blk.pcode.size(); ++i) {
                 const auto& s = blk.pcode[i];
                 if (skipCtrl && i + 1 == blk.pcode.size() &&
                     (s.op == "JMP" || s.op == "CJMP" || s.op == "RET")) break;
+                // 连续的填充指令只输出一次，避免几百行重复语句。
+                if (prev && SameStmt(*prev, s)) continue;
                 EmitOneStmt(s, out, xref, types);
+                prev = &s;
             }
         }
 
@@ -873,7 +882,12 @@ private:
 
             for (const auto& blk : func.blocks) {
                 out << "L" << Hex(blk.startAddr) << ": ;\n";
-                for (const auto& s : blk.pcode) EmitOneStmt(s, out, xref, types);
+                const PCodeStmt* prev = nullptr;
+                for (const auto& s : blk.pcode) {
+                    if (prev && SameStmt(*prev, s)) continue;
+                    EmitOneStmt(s, out, xref, types);
+                    prev = &s;
+                }
                 if (blk.pcode.empty()) continue;
                 const auto& last = blk.pcode.back();
 
@@ -892,6 +906,15 @@ private:
 public:
     static void EmitOneStmt(const PCodeStmt& s, std::ostream& out,
                             XrefDB& xref, const TypeRecovery& types) {
+        // 0x00 填充常被解码成 add byte ptr [reg], r8b；输出即 MEM(reg.q) += al，
+        // 这类语句毫无语义，直接在 emit 阶段挡掉（覆盖 [reg+disp] 等各种寻址变体）。
+        static const std::set<std::string> ByteRegs = {
+            "al","ah","bl","bh","cl","ch","dl","dh","sil","dil","bpl","spl",
+            "r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b" };
+        if (s.op == "ALU" && s.src1 == "add" &&
+            s.dst.rfind("MEM(", 0) == 0 && ByteRegs.count(s.src2))
+            return;
+
         auto Opnd = [](const std::string& x) -> std::string {
             static const std::set<std::string> Q = {
                 "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
@@ -1287,7 +1310,8 @@ private:
                     if (s.src1.find("GetSystemTimeAsFileTime") != std::string::npos) tim = true;
                     if (s.src1.find("RtlCaptureContext") != std::string::npos) rtl = true;
                 }
-                if (s.src1.find("0x2b992ddfa232") != std::string::npos) sec = true;
+                // MSVC 安全 cookie 常量有 ...232 / ...233 两种写法。
+                if (s.src1.find("0x2b992ddfa23") != std::string::npos) sec = true;
             }
         }
         if (sec && tim) {
@@ -1611,7 +1635,11 @@ private:
                     s.op = "POP"; s.dst = GetOp(0);
                 }
 
-                if (s.op != "UNK") f.blocks.back().pcode.push_back(s);
+                // 兜底：部分 Zydis 版本把 0x00 填充的 size/base 报得不一致，
+                // 这里在 PCode 层再挡一次 add byte ptr [rax], al。
+                const bool zeroPadding = s.op == "ALU" && s.src1 == "add" &&
+                    s.src2 == "al" && s.dst == "MEM(rax)";
+                if (s.op != "UNK" && !zeroPadding) f.blocks.back().pcode.push_back(s);
                 ++i;
                 if (m == "ret") break;
             }
