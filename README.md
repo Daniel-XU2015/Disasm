@@ -30,7 +30,7 @@
 4. **编译生成**：
    * 将配置切换到 **Release** 和 **x64**，点击生成即可。
 5. **加入证书**：
-   *把Disasm.cer加入Disasm.exe。
+   * 把Disasm.cer加入Disasm.exe。
 
 ## 🚀 使用方法
 
