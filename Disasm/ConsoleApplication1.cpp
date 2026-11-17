@@ -73,6 +73,59 @@ namespace {
         const char* p = ZydisMnemonicGetString(i.instr.mnemonic);
         return p ? p : "";
     }
+
+    // x86 条件码后缀全集（setcc / cmovcc / jcc 共用）。用于把「所有条件指令」
+    // 纳入反编译，而非只识别少数硬编码的 z/nz/l/g。
+    bool IsCondSuffix(const std::string& c) {
+        static const std::set<std::string> S = {
+            "e","z","ne","nz",              // 零
+            "b","c","nae","ae","nb","nc",   // 无符号：低于 / 进位 / 高于或等于
+            "a","nbe","be","na",            // 无符号：高于 / 低于或等于
+            "l","nge","ge","nl",            // 有符号：小于 / 大于或等于
+            "g","nle","le","ng",            // 有符号：大于 / 小于或等于
+            "s","ns",                       // 符号
+            "o","no",                       // 溢出
+            "p","pe","np","po"              // 奇偶
+        };
+        return S.count(c) != 0;
+    }
+
+    bool IsCmovcc(const std::string& m) {
+        return m.size() > 4 && m.rfind("cmov", 0) == 0 &&
+               IsCondSuffix(m.substr(4));
+    }
+
+    bool IsSetcc(const std::string& m) {
+        return m.size() > 3 && m.rfind("set", 0) == 0 &&
+               IsCondSuffix(m.substr(3));
+    }
+
+    // 常见 Win32/CRT API 的参数语义签名，仅用于生成代码中的说明性注释，
+    // 提升可读性（API_CALL 仍按 Win64 约定统一传 rcx/rdx/r8/r9）。
+    const char* ApiSignature(const std::string& name) {
+        static const std::unordered_map<std::string, const char*> Sig = {
+            {"MessageBoxA", "int MessageBoxA(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType)"},
+            {"MessageBoxW", "int MessageBoxW(HWND hWnd, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType)"},
+            {"LoadLibraryA", "HMODULE LoadLibraryA(LPCSTR lpLibFileName)"},
+            {"GetModuleHandleA", "HMODULE GetModuleHandleA(LPCSTR lpModuleName)"},
+            {"GetModuleHandleW", "HMODULE GetModuleHandleW(LPCWSTR lpModuleName)"},
+            {"GetProcAddress", "FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)"},
+            {"SetUnhandledExceptionFilter", "LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER)"},
+            {"GetSystemTimeAsFileTime", "void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)"},
+            {"QueryPerformanceCounter", "BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)"},
+            {"GetCurrentProcessId", "DWORD GetCurrentProcessId(void)"},
+            {"GetCurrentThreadId", "DWORD GetCurrentThreadId(void)"},
+            {"InitializeSListHead", "void InitializeSListHead(PSLIST_HEADER ListHead)"},
+            {"exit", "void exit(int status)"},
+            {"_exit", "void _exit(int status)"},
+            {"memcpy", "void* memcpy(void* dst, const void* src, size_t n)"},
+            {"terminate", "void terminate(void)"},
+            {"free", "void free(void* ptr)"},
+            {"malloc", "void* malloc(size_t size)"}
+        };
+        auto it = Sig.find(name);
+        return it == Sig.end() ? nullptr : it->second;
+    }
 }
 
 // =====================================================================
@@ -534,6 +587,9 @@ private:
 // =====================================================================
 class CompilableEmitter {
 public:
+    // 由 Emit() 在入口处设置：compilable 模式用它把 STR_xxx 还原成字符串字面量。
+    const std::unordered_map<uint64_t, std::string>* m_strings = nullptr;
+
     void EmitPreamble(std::ostream& out, const std::set<std::string>& usedApis) {
         // 不引入 windows.h / stdio.h / string.h：否则生成的 MessageBoxA、exit、
         // memcpy 等函数定义会和头文件声明冲突。这里只声明需要的三个 API。
@@ -558,7 +614,7 @@ FARPROC GetProcAddress(HMODULE, const char*);
         out << R"REG(
 typedef union { uint64_t q; uint32_t d; uint16_t w; struct { uint8_t l, h; }; } reg64_t;
 static reg64_t rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15;
-static int zflag = 0, sflag = 0;
+static int zflag = 0, sflag = 0, cflag = 0; // ZF / SF / CF
 #define eax rax.d
 #define ax  rax.w
 #define al  rax.l
@@ -656,13 +712,19 @@ static void UnknownInstruction(uint64_t address) { (void)address; }
 )API";
 
         if (!usedApis.empty()) {
-            out << "\n// APIs referenced:\n";
-            for (const auto& a : usedApis) out << "//   " << a << "\n";
+            out << "\n// APIs referenced (signature = parameter semantics):\n";
+            for (const auto& a : usedApis) {
+                out << "//   " << a;
+                if (const char* sig = ApiSignature(a)) out << "  ::  " << sig;
+                out << "\n";
+            }
         }
         out << "\n";
     }
 
-    std::string Emit(Function& func, XrefDB& xref, const TypeRecovery& types) {
+    std::string Emit(Function& func, XrefDB& xref, const TypeRecovery& types,
+                     const std::unordered_map<uint64_t, std::string>* strings) {
+        m_strings = strings;
         std::stringstream ss;
         ss << "uint64_t " << func.name
            << "(uint64_t _a1, uint64_t _a2, uint64_t _a3, uint64_t _a4) {\n"
@@ -670,10 +732,10 @@ static void UnknownInstruction(uint64_t address) { (void)address; }
 
         if (CanStructure(func)) {
             std::set<int> emitted;
-            StructCtx ctx(func, xref, types, ss, emitted);
+            StructCtx ctx(func, xref, types, ss, emitted, m_strings);
             ctx.EmitRegion(0, -1, -1);
         } else {
-            GotoCtx ctx(func, xref, types, ss);
+            GotoCtx ctx(func, xref, types, ss, m_strings);
             ctx.EmitAll();
         }
 
@@ -698,37 +760,50 @@ private:
         return true;
     }
 
-    static std::string FlagExpr(const std::string& m) {
-        std::string c = m;
-        if      (c.rfind("set", 0) == 0)  c = c.substr(3);
-        else if (c.rfind("cmov", 0) == 0) c = c.substr(4);
-        else if (!c.empty() && c[0] == 'j') c = c.substr(1);
-        if (c == "z"  || c == "e")  return "zflag";
-        if (c == "nz" || c == "ne") return "!zflag";
-        if (c == "l"  || c == "b"  || c == "nae" || c == "c")  return "sflag";
-        if (c == "g"  || c == "a"  || c == "nle" || c == "nc")  return "!sflag";
-        if (c == "le" || c == "be" || c == "ng") return "(zflag || sflag)";
-        if (c == "ge" || c == "ae" || c == "nl") return "(!zflag && !sflag)";
-        if (c == "s")  return "sflag";
-        if (c == "ns") return "!sflag";
+    // 权威条件码映射：去掉 j/set/cmov 前缀后，把 x86 条件码映射到 C 表达式。
+    // 关键：CF（无符号进位/借位，由 cmp 的无符号比较与 bt/bts/btr/btc 写入）与
+    // SF（有符号符号位，由 cmp 的有符号比较写入）必须分开，否则 jb/jae 等无符号
+    // 条件会读到有符号标志，bt 后的 jc 也会错位。这是反编译正确性的基础。
+    static std::string CondCore(const std::string& c) {
+        // 零标志
+        if (c == "z"  || c == "e")            return "zflag";
+        if (c == "nz" || c == "ne")           return "!zflag";
+        // 进位标志 CF：jb/jc/jnae (CF=1)，jae/jnb/jnc (CF=0)
+        if (c == "b"  || c == "c"  || c == "nae") return "cflag";
+        if (c == "ae" || c == "nb" || c == "nc")  return "!cflag";
+        // 无符号大小：ja (CF=0 && ZF=0)，jbe (CF=1 || ZF=1)
+        if (c == "a"  || c == "nbe")          return "(!cflag && !zflag)";
+        if (c == "be" || c == "na")           return "(cflag || zflag)";
+        // 有符号大小：jl (SF!=OF)，jge (SF==OF)，jg，jle
+        if (c == "l"  || c == "nge")          return "sflag";
+        if (c == "ge" || c == "nl")           return "!sflag";
+        if (c == "g"  || c == "nle")          return "(!zflag && !sflag)";
+        if (c == "le" || c == "ng")           return "(zflag || sflag)";
+        // 符号 / 溢出 / 奇偶：OF、PF 暂无独立标志，用 sflag / zflag 近似。
+        if (c == "s")                         return "sflag";
+        if (c == "ns")                        return "!sflag";
+        if (c == "o")                         return "sflag";   // OF ≈ 有符号符号
+        if (c == "no")                        return "!sflag";
+        if (c == "p" || c == "pe")            return "zflag";   // PF ≈ 零标志
+        if (c == "np" || c == "po")           return "!zflag";
         return "zflag";
     }
 
+    // 从 jXX / setXX / cmovXX 助记符中剥离前缀，交给 CondCore。
+    static std::string StripCondPrefix(std::string m) {
+        if      (m.rfind("set", 0) == 0)  m = m.substr(3);
+        else if (m.rfind("cmov", 0) == 0) m = m.substr(4);
+        else if (!m.empty() && m[0] == 'j') m = m.substr(1);
+        return m;
+    }
+
+    static std::string FlagExpr(const std::string& m) {
+        return CondCore(StripCondPrefix(m));
+    }
+
     static std::string CondOf(const std::string& m) {
-        // bt/bts/btr/btc 把测试位写入 CF，这里用 sflag 承载 CF，
-        // 因此 jc/jnc（及其别名）必须映射到 sflag，否则 bt 后的跳转
-        // 会错误回退到 zflag，造成「写 sflag、读 zflag」的语义错位。
-        if (m == "jz" || m == "je")     return "zflag";
-        if (m == "jnz" || m == "jne")   return "!zflag";
-        if (m == "jl" || m == "jb" || m == "jc" || m == "jnae")
-                                        return "sflag";
-        if (m == "jg" || m == "ja")     return "(!zflag && !sflag)";
-        if (m == "jle" || m == "jbe")   return "(zflag || sflag)";
-        if (m == "jge" || m == "jae" || m == "jnc" || m == "jnb")
-                                        return "!sflag";
-        if (m == "js")                  return "sflag";
-        if (m == "jns")                 return "!sflag";
-        return "zflag";
+        // 与 FlagExpr 共用同一映射，杜绝两套逻辑漂移导致的「写 sflag 读 zflag」。
+        return CondCore(StripCondPrefix(m));
     }
 
     static bool SameStmt(const PCodeStmt& a, const PCodeStmt& b) {
@@ -742,10 +817,12 @@ private:
         const TypeRecovery& types;
         std::ostream& out;
         std::set<int>& emitted;   // 引用：分支可共享「已发射块」集合
+        const std::unordered_map<uint64_t, std::string>* strings;
 
         StructCtx(const Function& f, XrefDB& x, const TypeRecovery& t,
-                  std::ostream& o, std::set<int>& em)
-            : func(f), xref(x), types(t), out(o), emitted(em) {}
+                  std::ostream& o, std::set<int>& em,
+                  const std::unordered_map<uint64_t, std::string>* st)
+            : func(f), xref(x), types(t), out(o), emitted(em), strings(st) {}
 
         // 一段输出里是否含真实语句（忽略空行与纯注释行）。
         static bool HasRealCode(const std::string& s) {
@@ -792,7 +869,7 @@ private:
                     (s.op == "JMP" || s.op == "CJMP" || s.op == "RET")) break;
                 // 连续的填充指令只输出一次，避免几百行重复语句。
                 if (prev && SameStmt(*prev, s)) continue;
-                EmitOneStmt(s, out, xref, types);
+                EmitOneStmt(s, out, xref, types, strings);
                 prev = &s;
             }
         }
@@ -837,8 +914,8 @@ private:
             // EmitBody(skipCtrl=true) 会跳过它，结果分支零输出却仍被当成非空，
             // 于是生成空的 if(){ }else{ }。共享 emitted 保证各块只处理一次。
             std::ostringstream thenBuf, elseBuf;
-            StructCtx thenCtx(func, xref, types, thenBuf, emitted);
-            StructCtx elseCtx(func, xref, types, elseBuf, emitted);
+            StructCtx thenCtx(func, xref, types, thenBuf, emitted, strings);
+            StructCtx elseCtx(func, xref, types, elseBuf, emitted, strings);
             thenCtx.EmitRegion(trueTgt, join, loopHeader);
             elseCtx.EmitRegion(falseTgt, join, loopHeader);
             const bool thenEmpty = !HasRealCode(thenBuf.str());
@@ -913,9 +990,11 @@ private:
         XrefDB& xref;
         const TypeRecovery& types;
         std::ostream& out;
+        const std::unordered_map<uint64_t, std::string>* strings;
 
-        GotoCtx(const Function& f, XrefDB& x, const TypeRecovery& t, std::ostream& o)
-            : func(f), xref(x), types(t), out(o) {}
+        GotoCtx(const Function& f, XrefDB& x, const TypeRecovery& t,
+                std::ostream& o, const std::unordered_map<uint64_t, std::string>* st)
+            : func(f), xref(x), types(t), out(o), strings(st) {}
 
         void EmitAll() {
             std::set<uint64_t> labels;
@@ -926,7 +1005,7 @@ private:
                 const PCodeStmt* prev = nullptr;
                 for (const auto& s : blk.pcode) {
                     if (prev && SameStmt(*prev, s)) continue;
-                    EmitOneStmt(s, out, xref, types);
+                    EmitOneStmt(s, out, xref, types, strings);
                     prev = &s;
                 }
                 if (blk.pcode.empty()) continue;
@@ -945,8 +1024,33 @@ private:
     };
 
 public:
+    // 把原始字节串转成 C 字符串字面量的内容（处理转义与非打印字符）。
+    static std::string CEscape(const std::string& s) {
+        std::string o;
+        char buf[8];
+        for (unsigned char c : s) {
+            switch (c) {
+            case '\n': o += "\\n";  break;
+            case '\r': o += "\\r";  break;
+            case '\t': o += "\\t";  break;
+            case '\\': o += "\\\\"; break;
+            case '"':  o += "\\\""; break;
+            case '\0': o += "\\0";  break;
+            default:
+                if (c < 0x20 || c >= 0x7f) {
+                    snprintf(buf, sizeof(buf), "\\x%02x", c);
+                    o += buf;
+                } else {
+                    o += static_cast<char>(c);
+                }
+            }
+        }
+        return o;
+    }
+
     static void EmitOneStmt(const PCodeStmt& s, std::ostream& out,
-                            XrefDB& xref, const TypeRecovery& types) {
+                            XrefDB& xref, const TypeRecovery& types,
+                            const std::unordered_map<uint64_t, std::string>* strings) {
         // 0x00 填充常被解码成 add byte ptr [reg], r8b；输出即 MEM(reg.q) += al，
         // 这类语句毫无语义，直接在 emit 阶段挡掉（覆盖 [reg+disp] 等各种寻址变体）。
         static const std::set<std::string> ByteRegs = {
@@ -956,7 +1060,7 @@ public:
             s.dst.rfind("MEM(", 0) == 0 && ByteRegs.count(s.src2))
             return;
 
-        auto Opnd = [](const std::string& x) -> std::string {
+        auto Opnd = [strings](const std::string& x) -> std::string {
             static const std::set<std::string> Q = {
                 "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
                 "r8","r9","r10","r11","r12","r13","r14","r15" };
@@ -996,6 +1100,13 @@ public:
                 return x + "ULL";
             if (x.rfind("MEM(", 0) == 0)
                 return "MEM(" + qualify(x.substr(4, x.size() - 5)) + ")";
+            if (x.rfind("STR_", 0) == 0 && strings) {
+                const uint64_t a = strtoull(x.c_str() + 4, nullptr, 16);
+                auto it = strings->find(a);
+                if (it != strings->end())
+                    return "(uint64_t)\"" + CEscape(it->second) + "\"";
+                return "0";
+            }
             if (x.rfind("STR_", 0) == 0) return "0";
             if (Q.count(x)) return x + ".q";
             // 子寄存器由 preamble 中的宏负责展开，直接输出原名即可。
@@ -1029,9 +1140,10 @@ public:
             else if (s.src1 == "dec") out << "    " << d << "--;\n";
             else if (s.src1 == "neg") out << "    " << d << " = (uint64_t)(-(int64_t)" << d << ");\n";
             else if (s.src1 == "not") out << "    " << d << " = ~" << d << ";\n";
-            else if (s.src1 == "shl") out << "    " << d << " <<= " << v << ";\n";
-            else if (s.src1 == "shr") out << "    " << d << " >>= " << v << ";\n";
-            else if (s.src1 == "sar") out << "    " << d << " = (uint64_t)((int64_t)" << d << " >> " << v << ");\n";
+            // x86 移位计数按 64 位宽度取模 &63；直接移位 >=64 在 C 里是 UB。
+            else if (s.src1 == "shl") out << "    " << d << " <<= ((" << v << ") & 63);\n";
+            else if (s.src1 == "shr") out << "    " << d << " >>= ((" << v << ") & 63);\n";
+            else if (s.src1 == "sar") out << "    " << d << " = (uint64_t)((int64_t)" << d << " >> ((" << v << ") & 63));\n";
             else {
                 std::string o = "+=";
                 if      (s.src1 == "sub")        o = "-=";
@@ -1042,12 +1154,15 @@ public:
             }
         }
         else if (s.op == "CMP") {
+            // cmp a,b 计算 a-b：CF = 无符号借位，SF ≈ 有符号小于，ZF = 相等。
             out << "    { uint64_t _l = " << Opnd(s.dst) << "; uint64_t _r = " << Opnd(s.src1)
-                << "; zflag = (_l == _r); sflag = ((int64_t)_l < (int64_t)_r); }\n";
+                << "; zflag = (_l == _r); cflag = (_l < _r); "
+                << "sflag = ((int64_t)_l < (int64_t)_r); }\n";
         }
         else if (s.op == "TEST") {
+            // TEST 执行按位与并清 CF/OF，只按结果设置 ZF/SF。
             out << "    { uint64_t _t = (" << Opnd(s.dst) << " & " << Opnd(s.src1)
-                << "); zflag = (_t == 0); sflag = ((int64_t)_t < 0); }\n";
+                << "); zflag = (_t == 0); cflag = 0; sflag = ((int64_t)_t < 0); }\n";
         }
         else if (s.op == "CALL") {
             if (s.src1.rfind("api_", 0) == 0) {
@@ -1075,9 +1190,18 @@ public:
         else if (s.op == "CMOV")
             out << "    if (" << FlagExpr(s.src2) << ") " << Opnd(s.dst)
                 << " = " << Opnd(s.src1) << ";\n";
-        else if (s.op == "BIT_TEST")
-            out << "    sflag = (((" << Opnd(s.dst) << ") >> (" << Opnd(s.src1)
-                << ")) & 1); // " << s.src2 << "\n";
+        else if (s.op == "BIT_TEST") {
+            // bt/bts/btr/btc 把测试位写入 CF，故写 cflag（与 jc/jnc 映射一致）。
+            const std::string d = Opnd(s.dst), bit = Opnd(s.src1);
+            out << "    cflag = (((" << d << ") >> ((" << bit << ") & 63)) & 1);\n";
+            // bts/btr/btc 除测试外还要写回目标位：置 1 / 清 0 / 取反。
+            if (s.src2 == "bts")
+                out << "    " << d << " |= (1ULL << ((" << bit << ") & 63));\n";
+            else if (s.src2 == "btr")
+                out << "    " << d << " &= ~(1ULL << ((" << bit << ") & 63));\n";
+            else if (s.src2 == "btc")
+                out << "    " << d << " ^= (1ULL << ((" << bit << ") & 63));\n";
+        }
         else if (s.op == "SIGN_EXT") {
             // cdqe: eax(32) 符号扩展到 rax(64); cdq/cqo/cwd: 写入 rdx 的符号位。
             const std::string& m = s.src1;
@@ -1181,13 +1305,14 @@ public:
 
         // 必须在 DynamicApiResolver 之后重命名，否则无法按 API 命名包装函数。
         RenameFunctions();
+        DetectUserEntry();
 
         CompilableEmitter em;
         TypeRecovery types;
         for (auto& f : m_functions) {
             if (f.isDead) continue;
             std::string code = (m_emitMode == EmitMode::Compilable)
-                ? em.Emit(f, m_xref, types) : EmitFunction(f);
+                ? em.Emit(f, m_xref, types, &m_strings) : EmitFunction(f);
             // 库函数保留真实反编译代码，只在函数开头加一行 FLIRT 标注，
             // 便于阅读时识别（不再用 return 0 空桩替换）。
             if (f.isLibraryFunc && !f.libFuncName.empty())
@@ -1218,6 +1343,18 @@ public:
             return false;
         };
 
+        // main 先跑 CRT 启动器，再调用识别出的用户入口（弹窗等），
+        // 否则生成程序只做一堆初始化就退出，看不到任何用户代码效果。
+        auto emitMain = [&](std::ostream& o) {
+            o << "int main(int argc, char** argv) {\n"
+              << "    (void)argc; (void)argv;\n";
+            if (hasEntry())
+                o << "    entry_point((uint64_t)argc, (uint64_t)argv, 0, 0);\n";
+            if (!m_userEntry.empty())
+                o << "    /* user entry */ " << m_userEntry << "(0, 0, 0, 0);\n";
+            o << "    return 0;\n}\n";
+        };
+
         if (m_emitMode == EmitMode::Compilable) {
             CompilableEmitter em;
             em.EmitPreamble(out, usedApis);
@@ -1235,9 +1372,7 @@ public:
             if (!hasEntry())
                 out << "uint64_t entry_point(uint64_t a,uint64_t b,uint64_t c,uint64_t d) "
                        "{ (void)a;(void)b;(void)c;(void)d; return 0; }\n";
-            out << "int main(int argc, char** argv) {\n"
-                << "    entry_point((uint64_t)argc, (uint64_t)argv, 0, 0);\n"
-                << "    return 0;\n}\n";
+            emitMain(out);
         } else {
             out << "\xEF\xBB\xBF#include <stdint.h>\n"
                 << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
@@ -1246,7 +1381,7 @@ public:
                 << "FARPROC GetProcAddress(HMODULE, const char*);\n"
                 << "#ifdef __cplusplus\n}\n#endif\n\n"
                 << "uint64_t rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15;\n"
-                << "static int zflag=0, sflag=0;\n"
+                << "static int zflag=0, sflag=0, cflag=0;\n"
                 << "uint8_t memory[0x100000];\n"
                 << "#define MEM(a) memory[(uint32_t)(a) & 0xFFFFF]\n"
                 << "static uint64_t ResolveApi(const char* name) {\n"
@@ -1269,9 +1404,7 @@ public:
             if (!hasEntry())
                 out << "uint64_t entry_point(uint64_t a,uint64_t b,uint64_t c,uint64_t d) "
                        "{ (void)a;(void)b;(void)c;(void)d; return 0; }\n";
-            out << "int main(int argc, char** argv) {\n"
-                << "    entry_point((uint64_t)argc, (uint64_t)argv, 0, 0);\n"
-                << "    return 0;\n}\n";
+            emitMain(out);
         }
     }
 
@@ -1295,6 +1428,25 @@ public:
         return true;
     }
 
+    // 找到直接调用 MessageBox 类 API 的用户函数，作为生成 main 的入口。
+    // 这样 main 不再只跑 CRT 启动器，而是能真正执行到弹窗代码。
+    void DetectUserEntry() {
+        m_userEntry.clear();
+        for (const auto& f : m_functions) {
+            if (f.isDead || f.isLibraryFunc || f.name == "entry_point") continue;
+            for (const auto& b : f.blocks) {
+                for (const auto& s : b.pcode) {
+                    if (s.op == "CALL" &&
+                        (s.src1.rfind("api_MessageBox", 0) == 0 ||
+                         s.src1.rfind("api_DialogBox", 0) == 0)) {
+                        m_userEntry = f.name;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // 避免生成的函数名与 preamble / C/C++ 关键字冲突。
     static bool IsReservedName(const std::string& n) {
         static const std::set<std::string> R = {
@@ -1303,7 +1455,7 @@ public:
             "MEM32", "MEM64", "generic_pfn_t", "reg64_t",
             "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
             "r8","r9","r10","r11","r12","r13","r14","r15",
-            "zflag","sflag","g_mem",
+            "zflag","sflag","cflag","g_mem",
             "auto","break","case","char","const","continue","default","do",
             "double","else","enum","extern","float","for","goto","if","inline",
             "int","long","register","restrict","return","short","signed",
@@ -1338,6 +1490,7 @@ private:
     std::unordered_map<uint64_t, std::string> m_strings;
     std::set<uint64_t> m_calledFuncs;
     XrefDB m_xref;
+    std::string m_userEntry;   // 直接调用 MessageBox 类 API 的用户函数，供 main 调用
 
     static uint64_t ImmediateTarget(const Insn& insn, const ZydisDecodedOperand& op) {
         if (op.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return 0;
@@ -1640,12 +1793,10 @@ private:
                 else if (m == "test") {
                     s.op = "TEST"; s.dst = GetOp(0); s.src1 = GetOp(1);
                 }
-                else if (m == "cmovz" || m == "cmove" || m == "cmovnz" ||
-                         m == "cmovne" || m == "cmovl" || m == "cmovg") {
+                else if (IsCmovcc(m)) {
                     s.op = "CMOV"; s.dst = GetOp(0); s.src1 = GetOp(1); s.src2 = m;
                 }
-                else if (m == "setz" || m == "sete" || m == "setnz" ||
-                         m == "setne" || m == "setl" || m == "setg") {
+                else if (IsSetcc(m)) {
                     s.op = "SETCC"; s.dst = GetOp(0); s.src1 = m;
                 }
                 else if (m == "call" && insn.instr.operand_count > 0) {
