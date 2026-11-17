@@ -696,6 +696,22 @@ private:
         return true;
     }
 
+    static std::string FlagExpr(const std::string& m) {
+        std::string c = m;
+        if      (c.rfind("set", 0) == 0)  c = c.substr(3);
+        else if (c.rfind("cmov", 0) == 0) c = c.substr(4);
+        else if (!c.empty() && c[0] == 'j') c = c.substr(1);
+        if (c == "z"  || c == "e")  return "zflag";
+        if (c == "nz" || c == "ne") return "!zflag";
+        if (c == "l"  || c == "b"  || c == "nae" || c == "c")  return "sflag";
+        if (c == "g"  || c == "a"  || c == "nle" || c == "nc")  return "!sflag";
+        if (c == "le" || c == "be" || c == "ng") return "(zflag || sflag)";
+        if (c == "ge" || c == "ae" || c == "nl") return "(!zflag && !sflag)";
+        if (c == "s")  return "sflag";
+        if (c == "ns") return "!sflag";
+        return "zflag";
+    }
+
     static std::string CondOf(const std::string& m) {
         if (m == "jz" || m == "je")     return "zflag";
         if (m == "jnz" || m == "jne")   return "!zflag";
@@ -1021,6 +1037,7 @@ public:
             } else if (s.src1 == "0") {
                 out << "    rax.q = 0; // [UNRESOLVED CALL]\n";
             } else {
+                // 间接调用：Opnd 已把 MEM 里的寄存器补成 .q，这里直接传目标地址即可。
                 out << "    rax.q = CallIndirect((uint64_t)(" << Opnd(s.src1)
                     << "), rcx.q, rdx.q, r8.q, r9.q);\n";
                 xref.Add({ s.addr, 0, Xref::CALL_FUNC, "indirect" });
@@ -1028,11 +1045,28 @@ public:
         }
         else if (s.op == "PUSH")     out << "    // push " << s.src1 << "\n";
         else if (s.op == "POP")      out << "    // pop " << s.dst << "\n";
-        else if (s.op == "SETCC")    out << "    // setcc " << s.dst << "\n";
-        else if (s.op == "CMOV")     out << "    // cmov " << s.dst << "\n";
-        else if (s.op == "BIT_TEST") out << "    // bit_test\n";
-        else if (s.op == "SIGN_EXT") out << "    // sign_ext\n";
-        else if (s.op == "SIMD_MOV") out << "    // simd_mov\n";
+        else if (s.op == "SETCC")
+            out << "    " << Opnd(s.dst) << " = (" << FlagExpr(s.src1) << ") ? 1 : 0;\n";
+        else if (s.op == "CMOV")
+            out << "    if (" << FlagExpr(s.src2) << ") " << Opnd(s.dst)
+                << " = " << Opnd(s.src1) << ";\n";
+        else if (s.op == "BIT_TEST")
+            out << "    sflag = (((" << Opnd(s.dst) << ") >> (" << Opnd(s.src1)
+                << ")) & 1); // " << s.src2 << "\n";
+        else if (s.op == "SIGN_EXT") {
+            // cdqe: eax(32) 符号扩展到 rax(64); cdq/cqo/cwd: 写入 rdx 的符号位。
+            const std::string& m = s.src1;
+            if (m == "cdqe")
+                out << "    rax.q = (uint64_t)(int64_t)(int32_t)rax.d;\n";
+            else if (m == "cqo")
+                out << "    rdx.q = (rax.q & 0x8000000000000000ULL) ? ~0ULL : 0ULL;\n";
+            else if (m == "cdq")
+                out << "    rdx.q = (rax.d & 0x80000000u) ? 0xffffffffULL : 0ULL;\n";
+            else
+                out << "    rdx.q = (rax.w & 0x8000u) ? 0xffffULL : 0ULL; // " << m << "\n";
+        }
+        else if (s.op == "SIMD_MOV")
+            out << "    /* simd mov " << s.dst << " <- " << s.src1 << " */\n";
         else if (s.op == "NOP" || s.op == "UNK" || s.op == "UNKNOWN")
                                      out << "    // nop\n";
     }
@@ -1593,7 +1627,7 @@ private:
                             + static_cast<int64_t>(insn.operands[0].mem.disp.value);
                         const std::string api = m_apiResolver->GetApiName(tgt);
                         s.src1 = api.empty()
-                            ? "((void(*)())MEM(0x" + ToHex(tgt) + "))"
+                            ? "MEM(0x" + ToHex(tgt) + ")"
                             : "api_" + api;
                     } else {
                         s.src1 = GetOp(0);
