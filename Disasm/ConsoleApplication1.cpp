@@ -1147,6 +1147,41 @@ public:
         return name;
     }
 
+    // 避免生成的函数名与 preamble / C/C++ 关键字冲突。
+    static bool IsReservedName(const std::string& n) {
+        static const std::set<std::string> R = {
+            "entry_point", "main", "ResolveApi", "CallIndirect",
+            "UnknownInstruction", "API_CALL", "GA", "MEM", "MEM8", "MEM16",
+            "MEM32", "MEM64", "generic_pfn_t", "reg64_t",
+            "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+            "r8","r9","r10","r11","r12","r13","r14","r15",
+            "zflag","sflag","g_mem",
+            "auto","break","case","char","const","continue","default","do",
+            "double","else","enum","extern","float","for","goto","if","inline",
+            "int","long","register","restrict","return","short","signed",
+            "sizeof","static","struct","switch","typedef","union","unsigned",
+            "void","volatile","while","asm","bool","catch","class","const_cast",
+            "delete","dynamic_cast","explicit","export","false","friend",
+            "mutable","namespace","new","nullptr","operator","private",
+            "protected","public","reinterpret_cast","static_cast","template",
+            "this","throw","true","try","typeid","typename","using","virtual",
+            "wchar_t"
+        };
+        return R.count(n) != 0;
+    }
+
+    static std::string UniqueName(const std::string& base, uint64_t addr,
+                                  std::unordered_map<std::string, int>& use,
+                                  std::set<std::string>& reserved) {
+        std::string candidate = base;
+        if (++use[base] > 1 || IsReservedName(candidate))
+            candidate = base + "_" + ToHex(addr);
+        while (reserved.count(candidate) || IsReservedName(candidate))
+            candidate += "_fn";
+        reserved.insert(candidate);
+        return candidate;
+    }
+
 private:
     uint64_t m_imageBase = 0;
     ApiResolver* m_apiResolver;
@@ -1216,41 +1251,87 @@ private:
     void RenameFunctions() {
         std::unordered_map<std::string, std::string> oldToNew;
         std::unordered_map<std::string, int> nameUse;
-        std::set<std::string> reserved{ "entry_point" };
+        std::set<std::string> reserved{ "entry_point", "main" };
 
+        // 第一轮：库函数直接用其识别出的语义名（如 __security_init_cookie）。
         for (auto& f : m_functions) {
             if (f.name == "entry_point") continue;
-            if (f.isLibraryFunc) { oldToNew[f.name] = f.name; continue; }
-
-            std::map<std::string, int> apiCount;
-            for (const auto& b : f.blocks) {
-                for (const auto& s : b.pcode) {
-                    if (s.op == "CALL" && s.src1.rfind("api_", 0) == 0)
-                        ++apiCount[s.src1.substr(4)];
-                }
-            }
-            std::string base;
-            if (!apiCount.empty()) {
-                auto best = std::max_element(apiCount.begin(), apiCount.end(),
-                    [](const auto& a, const auto& b) { return a.second < b.second; });
-                base = SafeName(best->first) + "_wrapper";
-            }
-            if (base.empty()) base = "sub_" + ToHex(f.startAddr);
-
-            std::string candidate = base;
-            if (++nameUse[base] > 1 || reserved.count(candidate))
-                candidate = base + "_" + ToHex(f.startAddr);
-            while (reserved.count(candidate)) candidate += "_fn";
-            reserved.insert(candidate);
-
+            if (!f.isLibraryFunc || f.libFuncName.empty()) continue;
+            const std::string candidate = UniqueName(
+                SafeName(f.libFuncName), f.startAddr, nameUse, reserved);
             oldToNew[f.name] = candidate;
             f.name = candidate;
         }
 
+        // 第二轮：普通函数按「实际调用最多的 API」直接命名。
+        // sub_1001000 若是对 socket 的薄封装，就会变成 socket，像人手写的名字。
+        for (auto& f : m_functions) {
+            if (f.name == "entry_point" || f.isLibraryFunc) continue;
+
+            std::map<std::string, int> apiCount;
+            int totalCalls = 0;
+            for (const auto& b : f.blocks) {
+                for (const auto& s : b.pcode) {
+                    if (s.op != "CALL") continue;
+                    ++totalCalls;
+                    if (s.src1.rfind("api_", 0) == 0)
+                        ++apiCount[s.src1.substr(4)];
+                }
+            }
+
+            std::string base;
+            if (!apiCount.empty()) {
+                auto best = std::max_element(apiCount.begin(), apiCount.end(),
+                    [](const auto& a, const auto& b) { return a.second < b.second; });
+                // 只有在 API 调用占主导时才用 API 名，避免误把调用方的名字套上去。
+                if (best->second * 2 >= totalCalls)
+                    base = SafeName(best->first);
+            }
+            if (base.empty()) base = "sub_" + ToHex(f.startAddr);
+
+            const std::string candidate = UniqueName(base, f.startAddr, nameUse, reserved);
+            oldToNew[f.name] = candidate;
+            f.name = candidate;
+        }
+
+        // 第三轮：没有 API 信息、但只转发给一个已命名函数的，命名为 <callee>_thunk。
+        for (auto& f : m_functions) {
+            if (f.name == "entry_point" || f.isLibraryFunc ||
+                f.name.rfind("sub_", 0) != 0) continue;
+
+            std::string soleCallee;
+            int calls = 0;
+            bool conflict = false;
+            for (const auto& b : f.blocks) {
+                for (const auto& s : b.pcode) {
+                    if (s.op != "CALL") continue;
+                    std::string target = s.src1;
+                    if (target.rfind("func_", 0) == 0) {
+                        auto it = oldToNew.find(target);
+                        if (it != oldToNew.end()) target = it->second;
+                    }
+                    if (target.rfind("api_", 0) == 0) continue;
+                    if (soleCallee.empty()) soleCallee = target;
+                    else if (soleCallee != target) { conflict = true; break; }
+                    ++calls;
+                }
+                if (conflict) break;
+            }
+            if (conflict || calls != 1 || soleCallee.empty() ||
+                soleCallee.rfind("sub_", 0) == 0) continue;
+
+            const std::string oldName = f.name;
+            const std::string candidate = UniqueName(
+                soleCallee + "_thunk", f.startAddr, nameUse, reserved);
+            oldToNew[oldName] = candidate;
+            f.name = candidate;
+        }
+
+        // 统一回写调用点：func_xxx 与已重命名的直接调用都要覆盖。
         for (auto& f : m_functions) {
             for (auto& b : f.blocks) {
                 for (auto& s : b.pcode) {
-                    if (s.op != "CALL" || s.src1.compare(0, 5, "func_") != 0) continue;
+                    if (s.op != "CALL") continue;
                     auto it = oldToNew.find(s.src1);
                     if (it == oldToNew.end()) continue;
                     s.src1 = it->second;
@@ -1609,7 +1690,7 @@ int main(int argc, char* argv[]) {
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
-        if (a == "-h" || a == "-help" || a == "--help" || a == "-hlep") {
+        if (a == "-h" || a == "-help" || a == "--help") {
             printHelp();
             return 0;
         }
