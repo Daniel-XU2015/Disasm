@@ -264,14 +264,15 @@ public:
                     auto it = regs.find(Canon(s.src1));
                     if (it != regs.end()) s.src1 = it->second;
                 }
-                if (s.op == "ALU") {
+                // xor r, r 是清零习惯用法：先识别，再决定是否替换源操作数，
+                // 否则 src2 被换成常量后就不是自异或了。
+                const bool zeroIdiom = s.op == "ALU" &&
+                    (s.src1 == "xor" || s.src1 == "pxor") &&
+                    Canon(s.dst) == Canon(s.src2);
+                if (s.op == "ALU" && !zeroIdiom) {
                     auto it = regs.find(Canon(s.src2));
                     if (it != regs.end()) s.src2 = it->second;
                 }
-
-                // xor r, r 是清零习惯用法，可直接折叠为常量 0。
-                const bool zeroIdiom = s.op == "ALU" && s.src1 == "xor"
-                    && Canon(s.dst) == Canon(s.src2);
 
                 if (!s.dst.empty() && s.op != "CMP" && s.op != "TEST")
                     regs.erase(dst);
@@ -533,10 +534,25 @@ private:
 class CompilableEmitter {
 public:
     void EmitPreamble(std::ostream& out, const std::set<std::string>& usedApis) {
+        // 不引入 windows.h / stdio.h / string.h：否则生成的 MessageBoxA、exit、
+        // memcpy 等函数定义会和头文件声明冲突。这里只声明需要的三个 API。
         out << "// Auto-generated: compile-only skeleton, NOT equivalent.\n"
-            << "#include <windows.h>\n#include <stdint.h>\n"
-            << "#include <stdio.h>\n#include <string.h>\n"
-            << "#pragma warning(disable: 4100 4189 4244 4245 4267 4311 4312 4700)\n\n";
+            << "#include <stdint.h>\n"
+            << "#pragma warning(disable: 4100 4189 4244 4245 4267 4311 4312 4700)\n\n"
+            << R"DECL(
+#ifdef __cplusplus
+extern "C" {
+#endif
+typedef void* HMODULE;
+typedef void* FARPROC;
+HMODULE LoadLibraryA(const char*);
+HMODULE GetModuleHandleA(const char*);
+FARPROC GetProcAddress(HMODULE, const char*);
+#ifdef __cplusplus
+}
+#endif
+)DECL";
+        out << "\n\n";
 
         out << R"REG(
 typedef union { uint64_t q; uint32_t d; uint16_t w; struct { uint8_t l, h; }; } reg64_t;
@@ -877,18 +893,9 @@ public:
     static void EmitOneStmt(const PCodeStmt& s, std::ostream& out,
                             XrefDB& xref, const TypeRecovery& types) {
         auto Opnd = [](const std::string& x) -> std::string {
-            if (x.empty()) return "0";
-            if (x.size() > 2 && x[0] == '0' && (x[1] == 'x' || x[1] == 'X'))
-                return x + "ULL";
-            if (x.rfind("MEM(", 0) == 0) return "MEM(" + x.substr(4);
-            if (x.rfind("STR_", 0) == 0) return "0";
-
             static const std::set<std::string> Q = {
                 "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
                 "r8","r9","r10","r11","r12","r13","r14","r15" };
-            if (Q.count(x)) return x + ".q";
-
-            // 子寄存器由 preamble 中的宏负责展开，直接输出原名即可。
             static const std::set<std::string> SUB = {
                 "eax","ebx","ecx","edx","esi","edi","ebp","esp",
                 "ax","bx","cx","dx","si","di","bp","sp",
@@ -896,12 +903,47 @@ public:
                 "r8d","r9d","r10d","r11d","r12d","r13d","r14d","r15d",
                 "r8w","r9w","r10w","r11w","r12w","r13w","r14w","r15w",
                 "r8b","r9b","r10b","r11b","r12b","r13b","r14b","r15b" };
+
+            // MEM() 里的寄存器必须输出 .q，否则 GA() 的 (uint32_t)(rax) 无法编译。
+            auto qualify = [&](const std::string& inner) {
+                std::string r;
+                size_t i = 0;
+                while (i < inner.size()) {
+                    const char c = inner[i];
+                    const bool alpha = (c >= 'a' && c <= 'z') ||
+                                       (c >= 'A' && c <= 'Z') || c == '_';
+                    if (!alpha) { r += c; ++i; continue; }
+                    size_t j = i;
+                    while (j < inner.size()) {
+                        const char d = inner[j];
+                        if (!((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') ||
+                              (d >= '0' && d <= '9') || d == '_')) break;
+                        ++j;
+                    }
+                    const std::string tok = inner.substr(i, j - i);
+                    r += Q.count(tok) ? tok + ".q" : tok;
+                    i = j;
+                }
+                return r;
+            };
+
+            if (x.empty()) return "0";
+            if (x.size() > 2 && x[0] == '0' && (x[1] == 'x' || x[1] == 'X'))
+                return x + "ULL";
+            if (x.rfind("MEM(", 0) == 0)
+                return "MEM(" + qualify(x.substr(4, x.size() - 5)) + ")";
+            if (x.rfind("STR_", 0) == 0) return "0";
+            if (Q.count(x)) return x + ".q";
+            // 子寄存器由 preamble 中的宏负责展开，直接输出原名即可。
             if (SUB.count(x)) return x;
             return x;
         };
 
         if (s.op == "MOV") {
-            out << "    " << Opnd(s.dst) << " = " << Opnd(s.src1) << ";\n";
+            // 去掉 xor 清零后常见的自赋值噪声（rax.q = rax.q）。
+            if (s.dst != s.src1) {
+                out << "    " << Opnd(s.dst) << " = " << Opnd(s.src1) << ";\n";
+            }
             std::string base;
             int32_t off = 0;
             if (TypeRecovery::ParseMem(s.dst, base, off) && off != 0) {
@@ -915,7 +957,11 @@ public:
         }
         else if (s.op == "ALU") {
             const std::string d = Opnd(s.dst), v = Opnd(s.src2);
-            if      (s.src1 == "inc") out << "    " << d << "++;\n";
+            // xor r, r 是编译器惯用的清零方式，直接写成 = 0 更像人写的代码。
+            if ((s.src1 == "xor" || s.src1 == "pxor") && s.dst == s.src2) {
+                out << "    " << d << " = 0;\n";
+            }
+            else if (s.src1 == "inc") out << "    " << d << "++;\n";
             else if (s.src1 == "dec") out << "    " << d << "--;\n";
             else if (s.src1 == "neg") out << "    " << d << " = (uint64_t)(-(int64_t)" << d << ");\n";
             else if (s.src1 == "not") out << "    " << d << " = ~" << d << ";\n";
@@ -1106,8 +1152,12 @@ public:
                 << "    entry_point((uint64_t)argc, (uint64_t)argv, 0, 0);\n"
                 << "    return 0;\n}\n";
         } else {
-            out << "\xEF\xBB\xBF#include <stdint.h>\n#include <windows.h>\n"
-                << "#include <string.h>\n\n"
+            out << "\xEF\xBB\xBF#include <stdint.h>\n"
+                << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+                << "typedef void* HMODULE;\ntypedef void* FARPROC;\n"
+                << "HMODULE GetModuleHandleA(const char*);\n"
+                << "FARPROC GetProcAddress(HMODULE, const char*);\n"
+                << "#ifdef __cplusplus\n}\n#endif\n\n"
                 << "uint64_t rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,r8,r9,r10,r11,r12,r13,r14,r15;\n"
                 << "static int zflag=0, sflag=0;\n"
                 << "uint8_t memory[0x100000];\n"
@@ -1145,6 +1195,17 @@ public:
         }
         if (name.empty() || (name[0] >= '0' && name[0] <= '9')) name = "fn_" + name;
         return name;
+    }
+
+    static bool IsIdentifier(const std::string& n) {
+        if (n.empty()) return false;
+        auto ok = [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '_';
+        };
+        if (!ok(n[0]) || (n[0] >= '0' && n[0] <= '9')) return false;
+        for (char c : n) if (!ok(c)) return false;
+        return true;
     }
 
     // 避免生成的函数名与 preamble / C/C++ 关键字冲突。
@@ -1269,12 +1330,9 @@ private:
             if (f.name == "entry_point" || f.isLibraryFunc) continue;
 
             std::map<std::string, int> apiCount;
-            int totalCalls = 0;
             for (const auto& b : f.blocks) {
                 for (const auto& s : b.pcode) {
-                    if (s.op != "CALL") continue;
-                    ++totalCalls;
-                    if (s.src1.rfind("api_", 0) == 0)
+                    if (s.op == "CALL" && s.src1.rfind("api_", 0) == 0)
                         ++apiCount[s.src1.substr(4)];
                 }
             }
@@ -1283,9 +1341,9 @@ private:
             if (!apiCount.empty()) {
                 auto best = std::max_element(apiCount.begin(), apiCount.end(),
                     [](const auto& a, const auto& b) { return a.second < b.second; });
-                // 只有在 API 调用占主导时才用 API 名，避免误把调用方的名字套上去。
-                if (best->second * 2 >= totalCalls)
-                    base = SafeName(best->first);
+                base = SafeName(best->first);
+                // 单个 API 直接叫它的名字（socket）；混用多个时才加 _wrapper。
+                if (apiCount.size() > 1) base += "_wrapper";
             }
             if (base.empty()) base = "sub_" + ToHex(f.startAddr);
 
@@ -1302,23 +1360,25 @@ private:
             std::string soleCallee;
             int calls = 0;
             bool conflict = false;
+            bool hasApiCall = false;
             for (const auto& b : f.blocks) {
                 for (const auto& s : b.pcode) {
                     if (s.op != "CALL") continue;
                     std::string target = s.src1;
+                    if (target.rfind("api_", 0) == 0) { hasApiCall = true; continue; }
                     if (target.rfind("func_", 0) == 0) {
                         auto it = oldToNew.find(target);
                         if (it != oldToNew.end()) target = it->second;
                     }
-                    if (target.rfind("api_", 0) == 0) continue;
                     if (soleCallee.empty()) soleCallee = target;
                     else if (soleCallee != target) { conflict = true; break; }
                     ++calls;
                 }
                 if (conflict) break;
             }
-            if (conflict || calls != 1 || soleCallee.empty() ||
-                soleCallee.rfind("sub_", 0) == 0) continue;
+            // 间接调用目标（如 ((void(*)())MEM(...))）不是合法标识符，不能拿来命名。
+            if (hasApiCall || conflict || calls != 1 || soleCallee.empty() ||
+                soleCallee.rfind("sub_", 0) == 0 || !IsIdentifier(soleCallee)) continue;
 
             const std::string oldName = f.name;
             const std::string candidate = UniqueName(
@@ -1388,12 +1448,16 @@ private:
                     ++i;
                     continue;
                 }
-                // 0x00 填充常被解码成 add byte ptr [rax], al，过滤掉。
+                // 0x00 填充解码成 add byte ptr [rax], al，过滤掉。
+                // 不依赖 operand.size（Zydis 版本间可能为 0/8），改看寻址形式。
                 if (m == "add" && insn.instr.operand_count == 2 &&
                     insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                    insn.operands[0].size == 8 &&
                     insn.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                    insn.operands[1].reg.value == ZYDIS_REGISTER_AL) {
+                    insn.operands[1].reg.value == ZYDIS_REGISTER_AL &&
+                    (insn.operands[0].mem.base == ZYDIS_REGISTER_RAX ||
+                     insn.operands[0].mem.base == ZYDIS_REGISTER_NONE) &&
+                    insn.operands[0].mem.index == ZYDIS_REGISTER_NONE &&
+                    insn.operands[0].mem.disp.value == 0) {
                     ++i;
                     continue;
                 }
