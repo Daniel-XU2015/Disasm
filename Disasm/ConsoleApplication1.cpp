@@ -16,6 +16,7 @@
 #include <set>
 #include <unordered_map>
 #include <algorithm>
+#include <utility>
 #include <thread>
 #include <atomic>
 #include <functional>
@@ -668,7 +669,8 @@ static void UnknownInstruction(uint64_t address) { (void)address; }
            << "    rcx.q=_a1; rdx.q=_a2; r8.q=_a3; r9.q=_a4;\n";
 
         if (CanStructure(func)) {
-            StructCtx ctx(func, xref, types, ss);
+            std::set<int> emitted;
+            StructCtx ctx(func, xref, types, ss, emitted);
             ctx.EmitRegion(0, -1, -1);
         } else {
             GotoCtx ctx(func, xref, types, ss);
@@ -713,12 +715,17 @@ private:
     }
 
     static std::string CondOf(const std::string& m) {
+        // bt/bts/btr/btc 把测试位写入 CF，这里用 sflag 承载 CF，
+        // 因此 jc/jnc（及其别名）必须映射到 sflag，否则 bt 后的跳转
+        // 会错误回退到 zflag，造成「写 sflag、读 zflag」的语义错位。
         if (m == "jz" || m == "je")     return "zflag";
         if (m == "jnz" || m == "jne")   return "!zflag";
-        if (m == "jl" || m == "jb")     return "sflag";
+        if (m == "jl" || m == "jb" || m == "jc" || m == "jnae")
+                                        return "sflag";
         if (m == "jg" || m == "ja")     return "(!zflag && !sflag)";
         if (m == "jle" || m == "jbe")   return "(zflag || sflag)";
-        if (m == "jge" || m == "jae")   return "!sflag";
+        if (m == "jge" || m == "jae" || m == "jnc" || m == "jnb")
+                                        return "!sflag";
         if (m == "js")                  return "sflag";
         if (m == "jns")                 return "!sflag";
         return "zflag";
@@ -734,10 +741,25 @@ private:
         XrefDB& xref;
         const TypeRecovery& types;
         std::ostream& out;
-        std::set<int> emitted;
+        std::set<int>& emitted;   // 引用：分支可共享「已发射块」集合
 
-        StructCtx(const Function& f, XrefDB& x, const TypeRecovery& t, std::ostream& o)
-            : func(f), xref(x), types(t), out(o) {}
+        StructCtx(const Function& f, XrefDB& x, const TypeRecovery& t,
+                  std::ostream& o, std::set<int>& em)
+            : func(f), xref(x), types(t), out(o), emitted(em) {}
+
+        // 一段输出里是否含真实语句（忽略空行与纯注释行）。
+        static bool HasRealCode(const std::string& s) {
+            std::istringstream in(s);
+            std::string line;
+            while (std::getline(in, line)) {
+                const size_t p = line.find_first_not_of(" \t\r\n");
+                if (p == std::string::npos) continue;
+                if (line.compare(p, 2, "//") == 0) continue;
+                if (line.compare(p, 2, "/*") == 0) continue;
+                return true;
+            }
+            return false;
+        }
 
         int FindBlock(uint64_t addr) const {
             for (const auto& b : func.blocks) if (b.startAddr == addr) return b.id;
@@ -809,27 +831,30 @@ private:
             const std::string cond = CondOf(mnemonic);
             int join = FindJoin(trueTgt, falseTgt);
             if (join < 0 || join == stop) join = stop;
-            const bool thenEmpty = (trueTgt == join || trueTgt == stop);
-            const bool elseEmpty = (falseTgt == join || falseTgt == stop);
+
+            // 把两个分支先发射到独立缓冲区，用「实际代码输出」判断是否为空。
+            // 仅凭 trueTgt==join 判断不可靠：块里若只有一条跳到 join 的 jmp，
+            // EmitBody(skipCtrl=true) 会跳过它，结果分支零输出却仍被当成非空，
+            // 于是生成空的 if(){ }else{ }。共享 emitted 保证各块只处理一次。
+            std::ostringstream thenBuf, elseBuf;
+            StructCtx thenCtx(func, xref, types, thenBuf, emitted);
+            StructCtx elseCtx(func, xref, types, elseBuf, emitted);
+            thenCtx.EmitRegion(trueTgt, join, loopHeader);
+            elseCtx.EmitRegion(falseTgt, join, loopHeader);
+            const bool thenEmpty = !HasRealCode(thenBuf.str());
+            const bool elseEmpty = !HasRealCode(elseBuf.str());
 
             if (thenEmpty && elseEmpty) {
-                if (join >= 0 && join != stop) EmitRegion(join, stop, loopHeader);
-                return;
-            }
-            if (thenEmpty) {
-                out << "    if (!(" << cond << ")) {\n";
-                EmitRegion(falseTgt, join, loopHeader);
-                out << "    }\n";
+                // 两个分支都不产生代码：只保留汇合后的部分。
+            } else if (thenEmpty) {
+                out << "    if (!(" << cond << ")) {\n" << elseBuf.str()
+                    << "    }\n";
             } else if (elseEmpty) {
-                out << "    if (" << cond << ") {\n";
-                EmitRegion(trueTgt, join, loopHeader);
-                out << "    }\n";
+                out << "    if (" << cond << ") {\n" << thenBuf.str()
+                    << "    }\n";
             } else {
-                out << "    if (" << cond << ") {\n";
-                EmitRegion(trueTgt, join, loopHeader);
-                out << "    } else {\n";
-                EmitRegion(falseTgt, join, loopHeader);
-                out << "    }\n";
+                out << "    if (" << cond << ") {\n" << thenBuf.str()
+                    << "    } else {\n" << elseBuf.str() << "    }\n";
             }
             if (join >= 0 && join != stop) EmitRegion(join, stop, loopHeader);
         }
@@ -1144,7 +1169,8 @@ public:
                     Function& f = m_functions[i];
                     if (f.isDead) continue;
                     IdentifyLibraryCode(f);
-                    if (f.isLibraryFunc) continue;
+                    // 库函数照常做 CFG/数据流分析：保留真实函数体，
+                    // 而不是用 return 0 空桩丢掉反编译出来的逻辑。
                     cfg.Build(f);
                     flow.Run(f);
                     dyn.Analyze(f, m_strings);
@@ -1160,9 +1186,13 @@ public:
         TypeRecovery types;
         for (auto& f : m_functions) {
             if (f.isDead) continue;
-            if (f.isLibraryFunc) { f.generatedCode = EmitLibraryStub(f); continue; }
-            f.generatedCode = (m_emitMode == EmitMode::Compilable)
+            std::string code = (m_emitMode == EmitMode::Compilable)
                 ? em.Emit(f, m_xref, types) : EmitFunction(f);
+            // 库函数保留真实反编译代码，只在函数开头加一行 FLIRT 标注，
+            // 便于阅读时识别（不再用 return 0 空桩替换）。
+            if (f.isLibraryFunc && !f.libFuncName.empty())
+                code = InjectFlirtNote(std::move(code), f.libFuncName);
+            f.generatedCode = std::move(code);
         }
     }
 
@@ -1357,14 +1387,15 @@ private:
         }
     }
 
-    std::string EmitLibraryStub(const Function& f) const {
-        std::stringstream ss;
-        ss << "uint64_t " << f.name
-           << "(uint64_t _a1,uint64_t _a2,uint64_t _a3,uint64_t _a4) {\n"
-           << "    (void)_a1;(void)_a2;(void)_a3;(void)_a4;\n"
-           << "    // [FLIRT] " << f.libFuncName << "\n"
-           << "    return 0;\n}\n\n";
-        return ss.str();
+    // 在已生成的函数体首个语句前插入 FLIRT 识别标注，保留真实代码。
+    static std::string InjectFlirtNote(std::string code, const std::string& libName) {
+        const size_t brace = code.find('{');
+        if (brace == std::string::npos) return code;
+        const size_t eol = code.find('\n', brace);
+        if (eol == std::string::npos) return code;
+        const std::string note = "    // [FLIRT] " + libName + " (identified library routine)\n";
+        code.insert(eol + 1, note);
+        return code;
     }
 
     void RenameFunctions() {
