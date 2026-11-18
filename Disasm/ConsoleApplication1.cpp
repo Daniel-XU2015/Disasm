@@ -832,6 +832,11 @@ static inline void TESTF(uint64_t a, uint64_t b) {
         else if (!body.empty() && body.back() != '\n')
             body += "\n";
 
+        // 常量返回桩收敛：去掉 prologue 与冗余 return 装载，压成单行。
+        // 必须在末尾补 return 之后调用，此时函数体结构已完整。
+        std::string compactStub = CollapseReturnStub(body, func.name);
+        if (!compactStub.empty()) return compactStub;
+
         ss << body << "}\n\n";
         return ss.str();
     }
@@ -912,6 +917,59 @@ private:
             depth += BraceDelta(text);
             if (depth < 0) depth = 0;
         }
+        return out;
+    }
+
+    // 返回桩收敛：形如
+    //   uint64_t name(a,b,c,d) {
+    //       rcx.q = a; rdx.q = b; r8.q = c; r9.q = d;
+    //       rax.q = CONST;
+    //       return rax.q;
+    //   }
+    // 的函数等价于 `uint64_t name(uint64_t,uint64_t,uint64_t,uint64_t){ return CONST; }`。
+    // 也处理只有 prologue + `return rax.q;`（无 CONST，返回当前 rax）的形态。
+    // 仅当函数体（去掉 prologue 行后）只剩这两条语句时收敛，避免误伤正常函数。
+    // 注意 rax.l/rax.d/rax.w（只写部分位）不收敛，因为返回值 rax.q 还含高位。
+    static std::string CollapseReturnStub(const std::string& body,
+                                          const std::string& fname) {
+        std::vector<std::string> lines;
+        {
+            std::istringstream in(body);
+            std::string l;
+            while (std::getline(in, l)) {
+                if (!l.empty() && l.back() == '\r') l.pop_back();
+                lines.push_back(l);
+            }
+        }
+        std::string retVal;
+        size_t i = 0;
+        // 第 0 行：签名（uint64_t name(...) { ）
+        if (lines.size() < 3 || lines[0].rfind("uint64_t ", 0) != 0)
+            return std::string();
+        i = 1;
+        // 第 1 行：prologue（rcx.q = ...; rdx.q = ...; r8.q = ...; r9.q = ...;）
+        if (i >= lines.size() || lines[i].find("rcx.q = ") == std::string::npos ||
+            lines[i].find("r9.q = ") == std::string::npos)
+            return std::string();
+        ++i;
+        // 可选一条 `    rax.q = CONST;`
+        if (i < lines.size()) {
+            const std::string s = lines[i];
+            const std::string p = "    rax.q = ";
+            if (s.rfind(p, 0) == 0 && s.size() > p.size() && s.back() == ';') {
+                const std::string expr = s.substr(p.size(), s.size() - p.size() - 1);
+                if (!expr.empty()) { retVal = expr; ++i; }
+            }
+        }
+        // 倒数第二行必须是 `    return rax.q;`，且之后只有空行
+        if (i >= lines.size() || lines[i] != "    return rax.q;") return std::string();
+        ++i;
+        while (i < lines.size() && lines[i].empty()) ++i;
+        if (i != lines.size()) return std::string();
+
+        std::string out = "uint64_t " + fname + "(uint64_t,uint64_t,uint64_t,uint64_t) { return ";
+        out += retVal.empty() ? std::string("rax.q") : retVal;
+        out += "; }\n\n";
         return out;
     }
 
