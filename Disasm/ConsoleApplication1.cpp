@@ -2144,7 +2144,7 @@ public:
 
     // 这些名字若直接用作本地函数名，会与 CRT intrinsic（memcpy/memset 即使不
     // include 头文件也可能触发 C2169）或系统头文件声明冲突。命中后由 UniqueName
-    // 自动改成 <name>_<addr>，既避开冲突又保留「这是哪个 API 的本地实现」的信息。
+    // 自动改成 <name>_impl，既避开冲突又保留「这是哪个 API 的本地实现」的信息。
     // 注意：MessageBoxW/CreateWindowExW/socket 等 GUI/网络 API 不在此列——
     // 本生成器不 include windows.h，它们作为函数名不会冲突，且可读性更好。
     static bool IsSystemSymbol(const std::string& n) {
@@ -2192,14 +2192,28 @@ public:
         return R.count(n) != 0 || IsSystemSymbol(n);
     }
 
+    // 生成的函数名不出现 <name>_<addr> 这类不可读地址后缀。
+    // - 保留名（CRT intrinsic / 系统符号）：加语义后缀 _impl，不含地址；
+    // - 同名 API 的多个本地实现：按出现次序加 _2 / _3 / ...；
+    // 两种情况下名字都稳定可读且不冲突。addr 参数保留但不再使用。
     static std::string UniqueName(const std::string& base, uint64_t addr,
         std::unordered_map<std::string, int>& use,
         std::set<std::string>& reserved) {
+        (void)addr;
+        int& n = ++use[base];
         std::string candidate = base;
-        if (++use[base] > 1 || IsReservedName(candidate))
-            candidate = base + "_" + ToHex(addr);
-        while (reserved.count(candidate) || IsReservedName(candidate))
-            candidate += "_fn";
+        if (IsReservedName(candidate)) {
+            // 系统符号/关键字：语义后缀，不用地址
+            candidate = base + "_impl";
+        } else if (n > 1) {
+            // 同名第 2 个及以后：十进制序号
+            candidate = base + "_" + std::to_string(n);
+        }
+        int guard = 0;
+        while (reserved.count(candidate) || IsReservedName(candidate)) {
+            candidate = base + "_" + std::to_string(++n);
+            if (++guard > 10000) break;
+        }
         reserved.insert(candidate);
         return candidate;
     }
