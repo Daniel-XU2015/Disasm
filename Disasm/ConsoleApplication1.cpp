@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cctype>
 #include <sstream>
 #include <iomanip>
 #include <map>
@@ -92,39 +93,102 @@ namespace {
 
     bool IsCmovcc(const std::string& m) {
         return m.size() > 4 && m.rfind("cmov", 0) == 0 &&
-               IsCondSuffix(m.substr(4));
+            IsCondSuffix(m.substr(4));
     }
 
     bool IsSetcc(const std::string& m) {
         return m.size() > 3 && m.rfind("set", 0) == 0 &&
-               IsCondSuffix(m.substr(3));
+            IsCondSuffix(m.substr(3));
     }
 
     // 常见 Win32/CRT API 的参数语义签名，仅用于生成代码中的说明性注释，
     // 提升可读性（API_CALL 仍按 Win64 约定统一传 rcx/rdx/r8/r9）。
     const char* ApiSignature(const std::string& name) {
         static const std::unordered_map<std::string, const char*> Sig = {
-            {"MessageBoxA", "int MessageBoxA(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType)"},
-            {"MessageBoxW", "int MessageBoxW(HWND hWnd, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType)"},
-            {"LoadLibraryA", "HMODULE LoadLibraryA(LPCSTR lpLibFileName)"},
-            {"GetModuleHandleA", "HMODULE GetModuleHandleA(LPCSTR lpModuleName)"},
-            {"GetModuleHandleW", "HMODULE GetModuleHandleW(LPCWSTR lpModuleName)"},
-            {"GetProcAddress", "FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)"},
-            {"SetUnhandledExceptionFilter", "LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER)"},
-            {"GetSystemTimeAsFileTime", "void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)"},
-            {"QueryPerformanceCounter", "BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)"},
-            {"GetCurrentProcessId", "DWORD GetCurrentProcessId(void)"},
-            {"GetCurrentThreadId", "DWORD GetCurrentThreadId(void)"},
-            {"InitializeSListHead", "void InitializeSListHead(PSLIST_HEADER ListHead)"},
-            {"exit", "void exit(int status)"},
-            {"_exit", "void _exit(int status)"},
-            {"memcpy", "void* memcpy(void* dst, const void* src, size_t n)"},
-            {"terminate", "void terminate(void)"},
-            {"free", "void free(void* ptr)"},
-            {"malloc", "void* malloc(size_t size)"}
+            { "MessageBoxA", "int MessageBoxA(HWND hWnd, LPCSTR lpText, LPCSTR lpCaption, UINT uType)" },
+            { "MessageBoxW", "int MessageBoxW(HWND hWnd, LPCWSTR lpText, LPCWSTR lpCaption, UINT uType)" },
+            { "LoadLibraryA", "HMODULE LoadLibraryA(LPCSTR lpLibFileName)" },
+            { "GetModuleHandleA", "HMODULE GetModuleHandleA(LPCSTR lpModuleName)" },
+            { "GetModuleHandleW", "HMODULE GetModuleHandleW(LPCWSTR lpModuleName)" },
+            { "GetProcAddress", "FARPROC GetProcAddress(HMODULE hModule, LPCSTR lpProcName)" },
+            { "SetUnhandledExceptionFilter", "LPTOP_LEVEL_EXCEPTION_FILTER SetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER)" },
+            { "GetSystemTimeAsFileTime", "void GetSystemTimeAsFileTime(LPFILETIME lpSystemTimeAsFileTime)" },
+            { "QueryPerformanceCounter", "BOOL QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)" },
+            { "GetCurrentProcessId", "DWORD GetCurrentProcessId(void)" },
+            { "GetCurrentThreadId", "DWORD GetCurrentThreadId(void)" },
+            { "InitializeSListHead", "void InitializeSListHead(PSLIST_HEADER ListHead)" },
+            { "exit", "void exit(int status)" },
+            { "_exit", "void _exit(int status)" },
+            { "memcpy", "void* memcpy(void* dst, const void* src, size_t n)" },
+            { "terminate", "void terminate(void)" },
+            { "free", "void free(void* ptr)" },
+            { "malloc", "void* malloc(size_t size)" }
         };
         auto it = Sig.find(name);
         return it == Sig.end() ? nullptr : it->second;
+    }
+
+    // 从说明性签名里提取参数名，供生成的函数形参使用。
+    // 如 "int MessageBoxW(HWND hWnd, LPCWSTR lpText, ...)" -> hWnd / lpText / ...
+    static std::vector<std::string> ApiParamNames(const std::string& sig) {
+        std::vector<std::string> names;
+        const size_t lp = sig.find('('), rp = sig.rfind(')');
+        if (lp == std::string::npos || rp == std::string::npos || rp <= lp) return names;
+        const std::string args = sig.substr(lp + 1, rp - lp - 1);
+        size_t pos = 0;
+        while (pos < args.size()) {
+            size_t comma = args.find(',', pos);
+            if (comma == std::string::npos) comma = args.size();
+            const std::string seg = args.substr(pos, comma - pos);
+            pos = comma + 1;
+            // 一段形参形如 "LPCTSTR lpName"：至少两个标识符时最后一个才是名字。
+            // 只有一个标识符（如 "LPTOP_LEVEL_EXCEPTION_FILTER"）说明是无名形参，跳过。
+            std::vector<std::string> ids;
+            for (size_t i = 0; i < seg.size();) {
+                const unsigned char c = static_cast<unsigned char>(seg[i]);
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+                    size_t j = i;
+                    while (j < seg.size()) {
+                        const unsigned char d = static_cast<unsigned char>(seg[j]);
+                        if (!((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') ||
+                              (d >= '0' && d <= '9') || d == '_')) break;
+                        ++j;
+                    }
+                    ids.push_back(seg.substr(i, j - i));
+                    i = j;
+                } else ++i;
+            }
+            if (ids.size() < 2) continue;
+            const std::string ident = ids.back();
+            if (ident == "void" || ident == "const" || ident == "struct" ||
+                ident == "unsigned" || ident == "signed" ||
+                ident == "long" || ident == "short") continue;
+            names.push_back(ident);
+        }
+        return names;
+    }
+
+    // 四个 Win64 形参的可读名字：已知 API 用语义名，未知函数统一 arg0..arg3。
+    // 生成名可能带 _wrapper / _thunk / <地址> 后缀，先剥掉再查签名表。
+    static std::vector<std::string> ParamNames(const std::string& funcName) {
+        std::string base = funcName;
+        for (;;) {
+            const size_t u = base.rfind('_');
+            if (u == std::string::npos || u == 0) break;
+            const std::string tail = base.substr(u + 1);
+            bool numeric = !tail.empty();
+            for (char c : tail)
+                if (!isxdigit(static_cast<unsigned char>(c))) { numeric = false; break; }
+            if (!(numeric || tail == "wrapper" || tail == "thunk" ||
+                  tail == "wrapper_thunk")) break;
+            base.resize(u);
+        }
+        const char* sig = ApiSignature(base);
+        std::vector<std::string> names = sig ? ApiParamNames(sig) : std::vector<std::string>();
+        names.resize(4);
+        for (int i = 0; i < 4; ++i)
+            if (names[i].empty()) names[i] = "arg" + std::to_string(i);
+        return names;
     }
 }
 
@@ -136,13 +200,13 @@ class ApiResolver {
 
 public:
     void LoadImports(const uint8_t* fileData, size_t fileSize,
-                     const IMAGE_NT_HEADERS* nt, uint64_t imageBase) {
+        const IMAGE_NT_HEADERS* nt, uint64_t imageBase) {
         const bool is64 = nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
         uint32_t dirRva = is64
             ? reinterpret_cast<const IMAGE_NT_HEADERS64*>(nt)->OptionalHeader
-                  .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress
+            .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress
             : reinterpret_cast<const IMAGE_NT_HEADERS32*>(nt)->OptionalHeader
-                  .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+            .DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
         if (!dirRva) return;
 
         const auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
@@ -181,7 +245,7 @@ public:
 
 private:
     static const uint8_t* RvaToOff(const uint8_t* f, size_t sz,
-                                   const IMAGE_NT_HEADERS* nt, uint32_t rva) {
+        const IMAGE_NT_HEADERS* nt, uint32_t rva) {
         const auto* sec = IMAGE_FIRST_SECTION(nt);
         for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
             const uint32_t vs = sec[i].Misc.VirtualSize
@@ -229,28 +293,34 @@ public:
 class TypeRecovery {
     struct F { uint32_t off; std::string name; };
     std::unordered_map<std::string, std::vector<F>> m_st;
+    // 结构库只收录内核结构；用户态程序按纯偏移匹配会被误标成
+    // _DEVICE_OBJECT/_IRP 等。默认关闭，仅识别到内核驱动特征时才打开。
+    bool m_structNotes = false;
 
 public:
+    void EnableStructNotes(bool on) { m_structNotes = on; }
+
     TypeRecovery() {
-        m_st["_DRIVER_OBJECT"] = { {0x00,"Type"},{0x02,"Size"},{0x08,"DeviceObject"},
-            {0x10,"Flags"},{0x18,"DriverStart"},{0x20,"DriverSize"},
-            {0x30,"DriverExtension"},{0x38,"DriverName"},{0x68,"DriverUnload"},
-            {0x70,"MajorFunction"} };
-        m_st["_DEVICE_OBJECT"] = { {0x00,"Type"},{0x02,"Size"},{0x04,"ReferenceCount"},
-            {0x08,"DriverObject"},{0x10,"NextDevice"},{0x18,"AttachedDevice"},
-            {0x20,"CurrentIrp"},{0x30,"Flags"},{0x40,"DeviceExtension"},
-            {0x48,"DeviceType"},{0x4c,"StackSize"} };
-        m_st["_IRP"] = { {0x00,"Type"},{0x02,"Size"},{0x08,"MdlAddress"},
-            {0x18,"Flags"},{0x30,"IoStatus"},{0x38,"RequestorMode"},
-            {0x40,"PendingReturned"},{0x48,"UserIosb"},{0x58,"UserEvent"},
-            {0x68,"CancelRoutine"} };
-        m_st["_IO_STACK_LOCATION"] = { {0x00,"MajorFunction"},{0x01,"MinorFunction"},
-            {0x08,"Flags"},{0x18,"Parameters"},{0x20,"DeviceObject"},
-            {0x28,"FileObject"} };
-        m_st["_UNICODE_STRING"] = { {0x00,"Length"},{0x02,"MaximumLength"},{0x08,"Buffer"} };
+        m_st["_DRIVER_OBJECT"] = { { 0x00,"Type" },{ 0x02,"Size" },{ 0x08,"DeviceObject" },
+            { 0x10,"Flags" },{ 0x18,"DriverStart" },{ 0x20,"DriverSize" },
+            { 0x30,"DriverExtension" },{ 0x38,"DriverName" },{ 0x68,"DriverUnload" },
+            { 0x70,"MajorFunction" } };
+        m_st["_DEVICE_OBJECT"] = { { 0x00,"Type" },{ 0x02,"Size" },{ 0x04,"ReferenceCount" },
+            { 0x08,"DriverObject" },{ 0x10,"NextDevice" },{ 0x18,"AttachedDevice" },
+            { 0x20,"CurrentIrp" },{ 0x30,"Flags" },{ 0x40,"DeviceExtension" },
+            { 0x48,"DeviceType" },{ 0x4c,"StackSize" } };
+        m_st["_IRP"] = { { 0x00,"Type" },{ 0x02,"Size" },{ 0x08,"MdlAddress" },
+            { 0x18,"Flags" },{ 0x30,"IoStatus" },{ 0x38,"RequestorMode" },
+            { 0x40,"PendingReturned" },{ 0x48,"UserIosb" },{ 0x58,"UserEvent" },
+            { 0x68,"CancelRoutine" } };
+        m_st["_IO_STACK_LOCATION"] = { { 0x00,"MajorFunction" },{ 0x01,"MinorFunction" },
+            { 0x08,"Flags" },{ 0x18,"Parameters" },{ 0x20,"DeviceObject" },
+            { 0x28,"FileObject" } };
+        m_st["_UNICODE_STRING"] = { { 0x00,"Length" },{ 0x02,"MaximumLength" },{ 0x08,"Buffer" } };
     }
 
     std::string CandidatesFor(int32_t off) const {
+        if (!m_structNotes) return "";  // 用户态程序无内核结构，注释只会误导
         std::string r;
         for (const auto& kv : m_st) {
             for (const auto& f : kv.second) {
@@ -286,22 +356,22 @@ class DataFlow {
 
     static std::string Canon(const std::string& r) {
         static const std::unordered_map<std::string, std::string> M = {
-            {"eax","rax"},{"ax","rax"},{"al","rax"},{"ah","rax"},
-            {"ebx","rbx"},{"bx","rbx"},{"bl","rbx"},{"bh","rbx"},
-            {"ecx","rcx"},{"cx","rcx"},{"cl","rcx"},{"ch","rcx"},
-            {"edx","rdx"},{"dx","rdx"},{"dl","rdx"},{"dh","rdx"},
-            {"esi","rsi"},{"si","rsi"},{"sil","rsi"},
-            {"edi","rdi"},{"di","rdi"},{"dil","rdi"},
-            {"ebp","rbp"},{"bp","rbp"},{"bpl","rbp"},
-            {"esp","rsp"},{"sp","rsp"},{"spl","rsp"},
-            {"r8d","r8"},{"r8w","r8"},{"r8b","r8"},
-            {"r9d","r9"},{"r9w","r9"},{"r9b","r9"},
-            {"r10d","r10"},{"r10w","r10"},{"r10b","r10"},
-            {"r11d","r11"},{"r11w","r11"},{"r11b","r11"},
-            {"r12d","r12"},{"r12w","r12"},{"r12b","r12"},
-            {"r13d","r13"},{"r13w","r13"},{"r13b","r13"},
-            {"r14d","r14"},{"r14w","r14"},{"r14b","r14"},
-            {"r15d","r15"},{"r15w","r15"},{"r15b","r15"} };
+            { "eax","rax" },{ "ax","rax" },{ "al","rax" },{ "ah","rax" },
+            { "ebx","rbx" },{ "bx","rbx" },{ "bl","rbx" },{ "bh","rbx" },
+            { "ecx","rcx" },{ "cx","rcx" },{ "cl","rcx" },{ "ch","rcx" },
+            { "edx","rdx" },{ "dx","rdx" },{ "dl","rdx" },{ "dh","rdx" },
+            { "esi","rsi" },{ "si","rsi" },{ "sil","rsi" },
+            { "edi","rdi" },{ "di","rdi" },{ "dil","rdi" },
+            { "ebp","rbp" },{ "bp","rbp" },{ "bpl","rbp" },
+            { "esp","rsp" },{ "sp","rsp" },{ "spl","rsp" },
+            { "r8d","r8" },{ "r8w","r8" },{ "r8b","r8" },
+            { "r9d","r9" },{ "r9w","r9" },{ "r9b","r9" },
+            { "r10d","r10" },{ "r10w","r10" },{ "r10b","r10" },
+            { "r11d","r11" },{ "r11w","r11" },{ "r11b","r11" },
+            { "r12d","r12" },{ "r12w","r12" },{ "r12b","r12" },
+            { "r13d","r13" },{ "r13w","r13" },{ "r13b","r13" },
+            { "r14d","r14" },{ "r14w","r14" },{ "r14b","r14" },
+            { "r15d","r15" },{ "r15w","r15" },{ "r15b","r15" } };
         auto it = M.find(r);
         return it != M.end() ? it->second : r;
     }
@@ -345,26 +415,26 @@ public:
 class DynamicApiResolver {
 public:
     void Analyze(Function& func,
-                 const std::unordered_map<uint64_t, std::string>& strings) const {
+        const std::unordered_map<uint64_t, std::string>& strings) const {
         auto resolve = [&](const std::string& v) -> std::string {
             if (v.rfind("STR_", 0)) return std::string();
             auto it = strings.find(strtoull(v.c_str() + 4, nullptr, 16));
             return it != strings.end() ? it->second : std::string();
-        };
+            };
         auto isGpa = [](const std::string& c) {
             return c.find("GetProcAddress") != std::string::npos
                 || c.find("LdrGetProcedureAddress") != std::string::npos;
-        };
+            };
         auto isLoad = [](const std::string& c) {
             return c.find("LoadLibrary") != std::string::npos
                 || c.find("LoadLibraryEx") != std::string::npos
                 || c.find("GetModuleHandle") != std::string::npos;
-        };
+            };
         auto isRegIndirect = [](const std::string& c) {
             return c == "rax" || c == "rcx" || c == "rdx" ||
-                   c == "r8"  || c == "r9" || c == "qword ptr [rax]" ||
-                   c.rfind("MEM(", 0) == 0;
-        };
+                c == "r8" || c == "r9" || c == "qword ptr [rax]" ||
+                c.rfind("MEM(", 0) == 0;
+            };
 
         for (auto& blk : func.blocks) {
             std::string pending;
@@ -467,7 +537,7 @@ private:
             if (std::find(succ.begin(), succ.end(), to) != succ.end()) return;
             succ.push_back(to);
             func.blocks[to].predecessors.push_back(from);
-        };
+            };
 
         // 按地址找后继，而不是依赖块编号（编号可能因 leader 重排而变化）。
         auto fallthrough = [&](int from) {
@@ -479,7 +549,7 @@ private:
                 if (b.startAddr < best) { best = b.startAddr; bestId = b.id; }
             }
             link(from, bestId);
-        };
+            };
 
         for (auto& b : func.blocks) {
             if (b.pcode.empty()) continue;
@@ -489,13 +559,15 @@ private:
                     auto it = addrToId.find(last.jumpTarget);
                     if (it != addrToId.end()) link(b.id, it->second);
                 }
-            } else if (last.op == "CJMP") {
+            }
+            else if (last.op == "CJMP") {
                 if (last.jumpTarget) {
                     auto it = addrToId.find(last.jumpTarget);
                     if (it != addrToId.end()) link(b.id, it->second);
                 }
                 fallthrough(b.id);
-            } else if (last.op != "RET") {
+            }
+            else if (last.op != "RET") {
                 fallthrough(b.id);
             }
         }
@@ -511,7 +583,7 @@ private:
             vis[b] = 1;
             for (int s : func.blocks[b].successors) if (!vis[s]) dfs(s);
             rpo.push_back(b);
-        };
+            };
         dfs(0);
         std::reverse(rpo.begin(), rpo.end());
 
@@ -525,7 +597,7 @@ private:
                 while (num[b] > num[a]) b = func.blocks[b].idom;
             }
             return a;
-        };
+            };
 
         func.blocks[0].idom = 0;
         bool changed = true;
@@ -647,20 +719,21 @@ static uint64_t ResolveApi(const char* name) {
     }
     return 0;
 }
-#define API_CALL(name,a1,a2,a3,a4) do { \
+#define API_CALL(name,arg0,arg1,arg2,arg3) do { \
     static uint64_t _p = 0; \
     if (!_p) _p = ResolveApi(name); \
-    if (_p) rax.q = ((generic_pfn_t)_p)((uint64_t)(a1),(uint64_t)(a2), \
-                                        (uint64_t)(a3),(uint64_t)(a4)); \
+    if (_p) rax.q = ((generic_pfn_t)_p)((uint64_t)(arg0),(uint64_t)(arg1), \
+                                        (uint64_t)(arg2),(uint64_t)(arg3)); \
 } while (0)
-static uint64_t CallIndirect(uint64_t target, uint64_t a1, uint64_t a2,
-                             uint64_t a3, uint64_t a4) {
+static uint64_t CallIndirect(uint64_t target, uint64_t arg0, uint64_t arg1,
+                             uint64_t arg2, uint64_t arg3) {
     if (!target) return 0;
-    return ((generic_pfn_t)target)(a1, a2, a3, a4);
+    return ((generic_pfn_t)target)(arg0, arg1, arg2, arg3);
 }
 static void UnknownInstruction(uint64_t address) { (void)address; }
 
-// 标志计算辅助：把冗长的 _l/_r/_t 临时变量收进函数，生成代码更接近手写风格。
+// Flag helpers: fold the verbose _l/_r/_t temporaries into functions so the
+// generated code reads more like hand-written C.
 static inline void CMP(uint64_t a, uint64_t b) {
     zflag = (a == b);
     cflag = (a < b);
@@ -686,23 +759,49 @@ static inline void TESTF(uint64_t a, uint64_t b) {
     }
 
     std::string Emit(Function& func, XrefDB& xref, const TypeRecovery& types,
-                     const std::unordered_map<uint64_t, std::string>* strings) {
+        const std::unordered_map<uint64_t, std::string>* strings) {
         m_strings = strings;
         std::stringstream ss;
+        const auto pn = ParamNames(func.name);
+
+        // 空函数（没有任何实质语句，只有 RET/NOP/UNK/UNKNOWN 或无指令）直接
+        // 输出紧凑单行桩，省略 rcx/rdx 装载与末尾 return rax.q。pragma 已禁
+        // 4100，无需 (void) 转换。与产物层「空桩收敛」后的形态保持一致。
+        {
+            bool meaningful = false;
+            for (const auto& b : func.blocks) {
+                for (const auto& s : b.pcode) {
+                    if (s.op == "RET" || s.op == "NOP" || s.op == "UNK" ||
+                        s.op == "UNKNOWN") continue;
+                    meaningful = true; break;
+                }
+                if (meaningful) break;
+            }
+            if (!meaningful)
+                return "uint64_t " + func.name +
+                    "(uint64_t,uint64_t,uint64_t,uint64_t) { return 0; }\n\n";
+        }
+
         ss << "uint64_t " << func.name
-           << "(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {\n"
-           << "    rcx.q = a1; rdx.q = a2; r8.q = a3; r9.q = a4;\n";
+            << "(uint64_t " << pn[0] << ", uint64_t " << pn[1]
+            << ", uint64_t " << pn[2] << ", uint64_t " << pn[3] << ") {\n"
+            << "    rcx.q = " << pn[0] << "; rdx.q = " << pn[1]
+            << "; r8.q = " << pn[2] << "; r9.q = " << pn[3] << ";\n";
 
         if (CanStructure(func)) {
             std::set<int> emitted;
             StructCtx ctx(func, xref, types, ss, emitted, m_strings);
             ctx.EmitRegion(0, -1, -1);
-        } else {
+        }
+        else {
             GotoCtx ctx(func, xref, types, ss, m_strings);
             ctx.EmitAll();
         }
 
         std::string body = StripSpinLoops(ss.str());
+        // 分支缓冲区合并后缩进不会累加，这里按大括号深度统一重排。
+        // 必须在 StripSpinLoops 之后、返回值折叠之前做，保证折叠只看顶层语句。
+        body = Reindent(body);
         ss.str(""); ss.clear();
 
         // 精简返回值：若函数体最后一行是 `rax.q = EXPR;`，其后立即函数结束，
@@ -716,7 +815,7 @@ static inline void TESTF(uint64_t a, uint64_t b) {
         if (lastLine.rfind(pfx, 0) == 0 && lastLine.size() > pfx.size() &&
             lastLine.back() == ';') {
             const std::string expr = lastLine.substr(pfx.size(),
-                                                     lastLine.size() - pfx.size() - 1);
+                lastLine.size() - pfx.size() - 1);
             if (!expr.empty())
                 body.replace(lineStart, e - lineStart, "    return " + expr + ";");
         }
@@ -737,6 +836,81 @@ static inline void TESTF(uint64_t a, uint64_t b) {
     }
 
 private:
+    // 统计一行代码里 { 与 } 的净增量，跳过字符串/字符字面量和注释。
+    static int BraceDelta(const std::string& line) {
+        int delta = 0;
+        enum { CODE, STR, CHR, LINE_COMMENT, BLOCK_COMMENT } st = CODE;
+        for (size_t i = 0; i < line.size(); ++i) {
+            const char c = line[i];
+            const char n = (i + 1 < line.size()) ? line[i + 1] : '\0';
+            switch (st) {
+            case CODE:
+                if      (c == '/' && n == '/') { st = LINE_COMMENT; ++i; }
+                else if (c == '/' && n == '*') { st = BLOCK_COMMENT; ++i; }
+                else if (c == '"')             st = STR;
+                else if (c == '\'')            st = CHR;
+                else if (c == '{') ++delta;
+                else if (c == '}') --delta;
+                break;
+            case STR:
+                if (c == '\\') { ++i; continue; }
+                if (c == '"') st = CODE;
+                break;
+            case CHR:
+                if (c == '\\') { ++i; continue; }
+                if (c == '\'') st = CODE;
+                break;
+            case LINE_COMMENT:
+                return delta;  // 行注释之后不可能再有代码
+            case BLOCK_COMMENT:
+                if (c == '*' && n == '/') { st = CODE; ++i; }
+                break;
+            }
+        }
+        return delta;
+    }
+
+    // 自适应缩进：各 emitter 硬编码 4 空格，且 if/else 分支先写进独立缓冲区
+    // 再嵌入，嵌套时缩进不会累加，深层代码挤成一团。这里按大括号深度统一
+    // 重排整个函数体（baseIndent=1，函数体内缩一层）。goto 标签顶格显示。
+    static std::string Reindent(const std::string& src, int baseIndent = 1) {
+        std::string out;
+        out.reserve(src.size() + src.size() / 8 + 64);
+        int depth = 0;
+        std::istringstream in(src);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const size_t p = line.find_first_not_of(" \t");
+            if (p == std::string::npos) { out += '\n'; continue; }
+            const std::string text = line.substr(p);
+
+            // "L140002bc0: ;" 这类 goto 标签顶格，便于定位跳转目标。
+            bool isLabel = false;
+            if (text.size() > 2 && text[0] == 'L') {
+                const size_t colon = text.find(':');
+                if (colon != std::string::npos && colon > 1) {
+                    isLabel = true;
+                    for (size_t k = 1; k < colon; ++k)
+                        if (!isxdigit(static_cast<unsigned char>(text[k]))) {
+                            isLabel = false; break;
+                        }
+                }
+            }
+
+            int ld = depth;
+            if (text[0] == '}') --ld;   // 收尾大括号与外层对齐
+            if (ld < 0) ld = 0;
+            out.append(static_cast<size_t>(isLabel ? 0 : (baseIndent + ld) * 4), ' ');
+            out += text;
+            out += '\n';
+
+            depth += BraceDelta(text);
+            if (depth < 0) depth = 0;
+        }
+        return out;
+    }
+
     static bool CanStructure(const Function& func) {
         for (const auto& blk : func.blocks) {
             if (!blk.isLoopHeader) continue;
@@ -754,18 +928,18 @@ private:
     // 条件会读到有符号标志，bt 后的 jc 也会错位。这是反编译正确性的基础。
     static std::string CondCore(const std::string& c) {
         // 零标志
-        if (c == "z"  || c == "e")            return "zflag";
+        if (c == "z" || c == "e")            return "zflag";
         if (c == "nz" || c == "ne")           return "!zflag";
         // 进位标志 CF：jb/jc/jnae (CF=1)，jae/jnb/jnc (CF=0)
-        if (c == "b"  || c == "c"  || c == "nae") return "cflag";
+        if (c == "b" || c == "c" || c == "nae") return "cflag";
         if (c == "ae" || c == "nb" || c == "nc")  return "!cflag";
         // 无符号大小：ja (CF=0 && ZF=0)，jbe (CF=1 || ZF=1)
-        if (c == "a"  || c == "nbe")          return "(!cflag && !zflag)";
+        if (c == "a" || c == "nbe")          return "(!cflag && !zflag)";
         if (c == "be" || c == "na")           return "(cflag || zflag)";
         // 有符号大小：jl (SF!=OF)，jge (SF==OF)，jg，jle
-        if (c == "l"  || c == "nge")          return "sflag";
+        if (c == "l" || c == "nge")          return "sflag";
         if (c == "ge" || c == "nl")           return "!sflag";
-        if (c == "g"  || c == "nle")          return "(!zflag && !sflag)";
+        if (c == "g" || c == "nle")          return "(!zflag && !sflag)";
         if (c == "le" || c == "ng")           return "(zflag || sflag)";
         // 符号 / 溢出 / 奇偶：OF、PF 暂无独立标志，用 sflag / zflag 近似。
         if (c == "s")                         return "sflag";
@@ -779,7 +953,7 @@ private:
 
     // 从 jXX / setXX / cmovXX 助记符中剥离前缀，交给 CondCore。
     static std::string StripCondPrefix(std::string m) {
-        if      (m.rfind("set", 0) == 0)  m = m.substr(3);
+        if (m.rfind("set", 0) == 0)  m = m.substr(3);
         else if (m.rfind("cmov", 0) == 0) m = m.substr(4);
         else if (!m.empty() && m[0] == 'j') m = m.substr(1);
         return m;
@@ -796,7 +970,7 @@ private:
 
     static bool SameStmt(const PCodeStmt& a, const PCodeStmt& b) {
         return a.op == b.op && a.dst == b.dst && a.src1 == b.src1 &&
-               a.src2 == b.src2 && a.jumpTarget == b.jumpTarget;
+            a.src2 == b.src2 && a.jumpTarget == b.jumpTarget;
     }
 
     struct StructCtx {
@@ -808,9 +982,10 @@ private:
         const std::unordered_map<uint64_t, std::string>* strings;
 
         StructCtx(const Function& f, XrefDB& x, const TypeRecovery& t,
-                  std::ostream& o, std::set<int>& em,
-                  const std::unordered_map<uint64_t, std::string>* st)
-            : func(f), xref(x), types(t), out(o), emitted(em), strings(st) {}
+            std::ostream& o, std::set<int>& em,
+            const std::unordered_map<uint64_t, std::string>* st)
+            : func(f), xref(x), types(t), out(o), emitted(em), strings(st) {
+        }
 
         // 一段输出里是否含真实语句（忽略空行与纯注释行）。
         static bool HasRealCode(const std::string& s) {
@@ -877,7 +1052,7 @@ private:
                 const size_t a = s.find_first_not_of(" \t");
                 const size_t b = s.find_last_not_of(" \t");
                 return (a == std::string::npos) ? std::string() : s.substr(a, b - a + 1);
-            };
+                };
             const std::string a = trim(args.substr(0, comma));
             const std::string b = trim(args.substr(comma + 1));
             if (a.empty() || b.empty()) return "";
@@ -888,11 +1063,11 @@ private:
                 if (cond == "!zflag") return t + " != 0";
                 return "";
             }
-            if      (cond == "zflag")                 return a + " == " + b;
+            if (cond == "zflag")                 return a + " == " + b;
             else if (cond == "!zflag")                return a + " != " + b;
-            else if (cond == "cflag")                 return a + " < "  + b;
+            else if (cond == "cflag")                 return a + " < " + b;
             else if (cond == "!cflag")                return a + " >= " + b;
-            else if (cond == "(!cflag && !zflag)")    return a + " > "  + b;
+            else if (cond == "(!cflag && !zflag)")    return a + " > " + b;
             else if (cond == "(cflag || zflag)")      return a + " <= " + b;
             return "";
         }
@@ -946,8 +1121,8 @@ private:
                 }
                 if (last.op == "CJMP") {
                     EmitConditional(FindBlock(last.jumpTarget), cur + 1,
-                                    stop, loopHeader, last.src1,
-                                    TailCmpDirectCond(blk, last.src1));
+                        stop, loopHeader, last.src1,
+                        TailCmpDirectCond(blk, last.src1));
                     return;
                 }
                 ++cur;
@@ -955,8 +1130,8 @@ private:
         }
 
         void EmitConditional(int trueTgt, int falseTgt, int stop,
-                             int loopHeader, const std::string& mnemonic,
-                             const std::string& directCond = "") {
+            int loopHeader, const std::string& mnemonic,
+            const std::string& directCond = "") {
             // 块尾 CMP 已并入条件，优先用直接比较表达式（如 rax.q == 0x10）。
             const std::string cond = directCond.empty() ? CondOf(mnemonic) : directCond;
             int join = FindJoin(trueTgt, falseTgt);
@@ -976,13 +1151,16 @@ private:
 
             if (thenEmpty && elseEmpty) {
                 // 两个分支都不产生代码：只保留汇合后的部分。
-            } else if (thenEmpty) {
+            }
+            else if (thenEmpty) {
                 out << "    if (!(" << cond << ")) {\n" << elseBuf.str()
                     << "    }\n";
-            } else if (elseEmpty) {
+            }
+            else if (elseEmpty) {
                 out << "    if (" << cond << ") {\n" << thenBuf.str()
                     << "    }\n";
-            } else {
+            }
+            else {
                 out << "    if (" << cond << ") {\n" << thenBuf.str()
                     << "    } else {\n" << elseBuf.str() << "    }\n";
             }
@@ -1012,7 +1190,8 @@ private:
                 if (jt == exits[0]) {
                     isWhileCond = true;
                     cond = "!(" + base + ")";
-                } else if (ft == exits[0]) {
+                }
+                else if (ft == exits[0]) {
                     isWhileCond = true;
                     cond = base;
                 }
@@ -1025,7 +1204,8 @@ private:
                     if (bodySet.count(s) && s != header && s != exits[0])
                         EmitRegion(s, -1, header);
                 out << "    }\n";
-            } else {
+            }
+            else {
                 out << "    while (1) {\n";
                 EmitBody(hblk, true);
                 if (!hblk.pcode.empty() && hblk.pcode.back().op == "CJMP") {
@@ -1053,8 +1233,9 @@ private:
         const std::unordered_map<uint64_t, std::string>* strings;
 
         GotoCtx(const Function& f, XrefDB& x, const TypeRecovery& t,
-                std::ostream& o, const std::unordered_map<uint64_t, std::string>* st)
-            : func(f), xref(x), types(t), out(o), strings(st) {}
+            std::ostream& o, const std::unordered_map<uint64_t, std::string>* st)
+            : func(f), xref(x), types(t), out(o), strings(st) {
+        }
 
         void EmitAll() {
             std::set<uint64_t> labels;
@@ -1073,9 +1254,11 @@ private:
 
                 if (last.op == "RET") {
                     out << "    return rax.q;\n";
-                } else if (last.op == "JMP" && last.jumpTarget && labels.count(last.jumpTarget)) {
+                }
+                else if (last.op == "JMP" && last.jumpTarget && labels.count(last.jumpTarget)) {
                     out << "    goto L" << Hex(last.jumpTarget) << ";\n";
-                } else if (last.op == "CJMP" && last.jumpTarget && labels.count(last.jumpTarget)) {
+                }
+                else if (last.op == "CJMP" && last.jumpTarget && labels.count(last.jumpTarget)) {
                     out << "    if (" << CondOf(last.src1) << ") goto L"
                         << Hex(last.jumpTarget) << ";\n";
                 }
@@ -1092,11 +1275,11 @@ public:
         size_t good = 0;
         for (unsigned char c : s) {
             const bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                               (c >= '0' && c <= '9');
+                (c >= '0' && c <= '9');
             const bool punct = (c == ' ' || c == '.' || c == '\\' || c == '/' ||
-                                c == ':' || c == '-' || c == '_' || c == ',' ||
-                                c == '!' || c == '?' || c == '\'' || c == '%' ||
-                                c == '(' || c == ')' || c == '[' || c == ']');
+                c == ':' || c == '-' || c == '_' || c == ',' ||
+                c == '!' || c == '?' || c == '\'' || c == '%' ||
+                c == '(' || c == ')' || c == '[' || c == ']');
             if (alnum || punct) ++good;
         }
         return good * 2 >= s.size();
@@ -1137,19 +1320,67 @@ public:
             for (size_t k = 0; k < lhs.size(); ++k) {
                 const char c = lhs[k];
                 if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-                      c == '.' || c == '_')) return false;
+                    c == '.' || c == '_')) return false;
             }
             const std::string rhs = t.substr(eq + 1, t.size() - eq - 2);
             if (rhs.empty() || rhs.size() > 40) return false;
             for (size_t k = 0; k < rhs.size(); ++k) {
                 const char c = rhs[k];
                 if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                      (c >= '0' && c <= '9') || c == '.' || c == 'x' ||
-                      c == 'X' || c == 'U' || c == 'L' || c == '-')) return false;
+                    (c >= '0' && c <= '9') || c == '.' || c == 'x' ||
+                    c == 'X' || c == 'U' || c == 'L' || c == '-')) return false;
             }
             if (++assigns > 2) return false;
         }
         return assigns > 0;
+    }
+
+    // 把 `while (1) { ...; break; }` 识别为「执行一次即退出」的循环：
+    // 条件恒真、break 位于循环体末尾，语义等价于把循环体顺序执行一遍，
+    // 去掉 while 壳与 break 不改变结果，可清掉反编译残留的一次性循环。
+    static bool IsOneShotLoop(const std::string& header, const std::string& body,
+                              std::string& flat) {
+        const size_t brace = header.find('{');
+        const std::string h = brace == std::string::npos ? header : header.substr(0, brace);
+        std::string t;
+        for (char c : h) if (c != ' ' && c != '\t') t += c;
+        if (t != "while(1)") return false;
+
+        std::vector<std::string> lines;
+        std::istringstream in(body);
+        std::string l;
+        while (std::getline(in, l)) lines.push_back(l);
+        int last = -1;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            std::string s;
+            for (unsigned char c : lines[i])
+                if (c != ' ' && c != '\t' && c != '\r') s += static_cast<char>(c);
+            if (!s.empty()) last = static_cast<int>(i);
+        }
+        if (last < 0) return false;
+        std::string tail;
+        for (unsigned char c : lines[last])
+            if (c != ' ' && c != '\t' && c != '\r') tail += static_cast<char>(c);
+        if (tail != "break;") return false;
+
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (static_cast<int>(i) == last) continue;
+            const std::string& s = lines[i];
+            if (s.find("if ") != std::string::npos || s.find("if(") != std::string::npos ||
+                s.find("while") != std::string::npos || s.find("for(") != std::string::npos ||
+                s.find("switch") != std::string::npos ||
+                s.find("goto") != std::string::npos ||
+                s.find("return") != std::string::npos ||
+                s.find("continue") != std::string::npos) return false;
+        }
+
+        flat.clear();
+        for (size_t i = 0; i < lines.size(); ++i) {
+            if (static_cast<int>(i) == last) continue;
+            const std::string& s = lines[i];
+            flat += (s.size() >= 4 ? s.substr(4) : s) + "\n";
+        }
+        return !flat.empty();
     }
 
     // 后处理：折叠上述空转 while 循环，保留其中的赋值（等价于循环至少
@@ -1189,8 +1420,16 @@ public:
                     out << (bl.size() >= 4 ? bl.substr(4) : bl) << "\n";
                 }
                 i = close;  // 跳过整个循环
-            } else {
-                out << l << "\n";  // 循环体各行照常输出
+            }
+            else {
+                std::string flat;
+                if (IsOneShotLoop(l.substr(pos), body, flat)) {
+                    out << "    /* [one-shot loop flattened] */\n" << flat;
+                    i = close;  // 跳过整个 while(1){...;break;}
+                }
+                else {
+                    out << l << "\n";  // 循环体各行照常输出
+                }
             }
         }
         return out.str();
@@ -1212,7 +1451,8 @@ public:
                 if (c < 0x20 || c >= 0x7f) {
                     snprintf(buf, sizeof(buf), "\\x%02x", c);
                     o += buf;
-                } else {
+                }
+                else {
                     o += static_cast<char>(c);
                 }
             }
@@ -1221,8 +1461,8 @@ public:
     }
 
     static void EmitOneStmt(const PCodeStmt& s, std::ostream& out,
-                            XrefDB& xref, const TypeRecovery& types,
-                            const std::unordered_map<uint64_t, std::string>* strings) {
+        XrefDB& xref, const TypeRecovery& types,
+        const std::unordered_map<uint64_t, std::string>* strings) {
         // 0x00 填充常被解码成 add byte ptr [reg], r8b；输出即 MEM(reg.q) += al，
         // 这类语句毫无语义，直接在 emit 阶段挡掉（覆盖 [reg+disp] 等各种寻址变体）。
         static const std::set<std::string> ByteRegs = {
@@ -1241,7 +1481,7 @@ public:
         // 以 rsp 为基址的真实栈变量访问（那些是 MEM(rsp.q+off) 形式，dst 不是 rsp）。
         auto IsImm = [](const std::string& x) {
             return x.size() > 2 && x[0] == '0' && (x[1] == 'x' || x[1] == 'X');
-        };
+            };
         if (s.op == "ALU" && s.dst == "rsp" &&
             (s.src1 == "sub" || s.src1 == "add") && IsImm(s.src2))
             return;
@@ -1261,26 +1501,26 @@ public:
             // 子寄存器名 -> 联合字段访问（eax -> rax.d、sil -> rsi.l、r8b -> r8.l）。
             // preamble 已删除几十行 #define 别名，改由这里直接输出。
             static const std::unordered_map<std::string, std::string> SubField = {
-                {"eax","rax.d"},{"ax","rax.w"},{"al","rax.l"},{"ah","rax.h"},
-                {"ebx","rbx.d"},{"bx","rbx.w"},{"bl","rbx.l"},{"bh","rbx.h"},
-                {"ecx","rcx.d"},{"cx","rcx.w"},{"cl","rcx.l"},{"ch","rcx.h"},
-                {"edx","rdx.d"},{"dx","rdx.w"},{"dl","rdx.l"},{"dh","rdx.h"},
-                {"esi","rsi.d"},{"si","rsi.w"},{"sil","rsi.l"},
-                {"edi","rdi.d"},{"di","rdi.w"},{"dil","rdi.l"},
-                {"ebp","rbp.d"},{"bp","rbp.w"},{"bpl","rbp.l"},
-                {"esp","rsp.d"},{"sp","rsp.w"},{"spl","rsp.l"},
-                {"r8d","r8.d"},{"r8w","r8.w"},{"r8b","r8.l"},
-                {"r9d","r9.d"},{"r9w","r9.w"},{"r9b","r9.l"},
-                {"r10d","r10.d"},{"r10w","r10.w"},{"r10b","r10.l"},
-                {"r11d","r11.d"},{"r11w","r11.w"},{"r11b","r11.l"},
-                {"r12d","r12.d"},{"r12w","r12.w"},{"r12b","r12.l"},
-                {"r13d","r13.d"},{"r13w","r13.w"},{"r13b","r13.l"},
-                {"r14d","r14.d"},{"r14w","r14.w"},{"r14b","r14.l"},
-                {"r15d","r15.d"},{"r15w","r15.w"},{"r15b","r15.l"} };
+                { "eax","rax.d" },{ "ax","rax.w" },{ "al","rax.l" },{ "ah","rax.h" },
+                { "ebx","rbx.d" },{ "bx","rbx.w" },{ "bl","rbx.l" },{ "bh","rbx.h" },
+                { "ecx","rcx.d" },{ "cx","rcx.w" },{ "cl","rcx.l" },{ "ch","rcx.h" },
+                { "edx","rdx.d" },{ "dx","rdx.w" },{ "dl","rdx.l" },{ "dh","rdx.h" },
+                { "esi","rsi.d" },{ "si","rsi.w" },{ "sil","rsi.l" },
+                { "edi","rdi.d" },{ "di","rdi.w" },{ "dil","rdi.l" },
+                { "ebp","rbp.d" },{ "bp","rbp.w" },{ "bpl","rbp.l" },
+                { "esp","rsp.d" },{ "sp","rsp.w" },{ "spl","rsp.l" },
+                { "r8d","r8.d" },{ "r8w","r8.w" },{ "r8b","r8.l" },
+                { "r9d","r9.d" },{ "r9w","r9.w" },{ "r9b","r9.l" },
+                { "r10d","r10.d" },{ "r10w","r10.w" },{ "r10b","r10.l" },
+                { "r11d","r11.d" },{ "r11w","r11.w" },{ "r11b","r11.l" },
+                { "r12d","r12.d" },{ "r12w","r12.w" },{ "r12b","r12.l" },
+                { "r13d","r13.d" },{ "r13w","r13.w" },{ "r13b","r13.l" },
+                { "r14d","r14.d" },{ "r14w","r14.w" },{ "r14b","r14.l" },
+                { "r15d","r15.d" },{ "r15w","r15.w" },{ "r15b","r15.l" } };
             auto subField = [&](const std::string& r) -> std::string {
                 auto it = SubField.find(r);
                 return it == SubField.end() ? r : it->second;
-            };
+                };
 
             // MEM() 里的寄存器必须输出 .q，否则 GA() 的 (uint32_t)(rax) 无法编译。
             auto qualify = [&](const std::string& inner) {
@@ -1289,13 +1529,13 @@ public:
                 while (i < inner.size()) {
                     const char c = inner[i];
                     const bool alpha = (c >= 'a' && c <= 'z') ||
-                                       (c >= 'A' && c <= 'Z') || c == '_';
+                        (c >= 'A' && c <= 'Z') || c == '_';
                     if (!alpha) { r += c; ++i; continue; }
                     size_t j = i;
                     while (j < inner.size()) {
                         const char d = inner[j];
                         if (!((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') ||
-                              (d >= '0' && d <= '9') || d == '_')) break;
+                            (d >= '0' && d <= '9') || d == '_')) break;
                         ++j;
                     }
                     const std::string tok = inner.substr(i, j - i);
@@ -1304,7 +1544,7 @@ public:
                     i = j;
                 }
                 return r;
-            };
+                };
 
             if (x.empty()) return "0";
             if (x.size() > 2 && x[0] == '0' && (x[1] == 'x' || x[1] == 'X'))
@@ -1314,8 +1554,13 @@ public:
             if (x.rfind("STR_", 0) == 0 && strings) {
                 const uint64_t a = strtoull(x.c_str() + 4, nullptr, 16);
                 auto it = strings->find(a);
-                if (it != strings->end())
-                    return "(uint64_t)\"" + CEscape(it->second) + "\"";
+                if (it != strings->end()) {
+                    // 字符串字面量本质是数据段地址；参与指针算术（如 ETW 描述符的
+                    // 相对偏移、C++ RTTI 重定位）是原程序行为。标注来源 VA，
+                    // 让读者能追溯 rax -= (uint64_t)"..." 这类等式在算什么。
+                    std::stringstream va; va << std::hex << a;
+                    return "(uint64_t)\"" + CEscape(it->second) + "\" /* @" + va.str() + " */";
+                }
                 return "0";
             }
             if (x.rfind("STR_", 0) == 0) return "0";
@@ -1323,7 +1568,7 @@ public:
             // 子寄存器输出成联合字段访问（eax -> rax.d），不再依赖 preamble 别名宏。
             if (SUB.count(x)) return subField(x);
             return x;
-        };
+            };
 
         if (s.op == "MOV") {
             // 去掉 xor 清零后常见的自赋值噪声（rax.q = rax.q）。
@@ -1357,10 +1602,10 @@ public:
             else if (s.src1 == "sar") out << "    " << d << " = (uint64_t)((int64_t)" << d << " >> ((" << v << ") & 63));\n";
             else {
                 std::string o = "+=";
-                if      (s.src1 == "sub")        o = "-=";
+                if (s.src1 == "sub")        o = "-=";
                 else if (s.src1 == "xor" || s.src1 == "pxor") o = "^=";
                 else if (s.src1 == "and" || s.src1 == "pand") o = "&=";
-                else if (s.src1 == "or"  || s.src1 == "por")  o = "|=";
+                else if (s.src1 == "or" || s.src1 == "por")  o = "|=";
                 out << "    " << d << " " << o << " " << v << ";\n";
             }
         }
@@ -1374,14 +1619,17 @@ public:
                 const std::string name = s.src1.substr(4);
                 out << "    API_CALL(\"" << name << "\", rcx.q, rdx.q, r8.q, r9.q);\n";
                 xref.Add({ s.addr, 0, Xref::CALL_API, name });
-            } else if (s.src1.rfind("func_", 0) == 0 || s.src2 == "DIRECT_FUNC") {
+            }
+            else if (s.src1.rfind("func_", 0) == 0 || s.src2 == "DIRECT_FUNC") {
                 out << "    rax.q = " << s.src1 << "(rcx.q, rdx.q, r8.q, r9.q);\n";
                 const uint64_t target = s.src1.rfind("func_", 0) == 0
                     ? strtoull(s.src1.c_str() + 5, nullptr, 16) : 0;
                 xref.Add({ s.addr, target, Xref::CALL_FUNC, s.src1 });
-            } else if (s.src1 == "0") {
+            }
+            else if (s.src1 == "0") {
                 out << "    rax.q = 0; // [UNRESOLVED CALL]\n";
-            } else {
+            }
+            else {
                 // 间接调用：Opnd 已把 MEM 里的寄存器补成 .q，这里直接传目标地址即可。
                 out << "    rax.q = CallIndirect((uint64_t)(" << Opnd(s.src1)
                     << "), rcx.q, rdx.q, r8.q, r9.q);\n";
@@ -1394,7 +1642,7 @@ public:
             out << "    " << Opnd(s.dst) << " = (" << FlagExpr(s.src1) << ") ? 1 : 0;\n";
         else if (s.op == "CMOV")
             out << "    if (" << FlagExpr(s.src2) << ") " << Opnd(s.dst)
-                << " = " << Opnd(s.src1) << ";\n";
+            << " = " << Opnd(s.src1) << ";\n";
         else if (s.op == "BIT_TEST") {
             // bt/bts/btr/btc 把测试位写入 CF，故写 cflag（与 jc/jnc 映射一致）。
             const std::string d = Opnd(s.dst), bit = Opnd(s.src1);
@@ -1422,7 +1670,7 @@ public:
         else if (s.op == "SIMD_MOV")
             out << "    /* simd mov " << s.dst << " <- " << s.src1 << " */\n";
         else if (s.op == "NOP" || s.op == "UNK" || s.op == "UNKNOWN")
-                                     out << "    // nop\n";
+            out << "    // nop\n";
     }
 };
 
@@ -1437,7 +1685,7 @@ public:
     void SetEmitMode(EmitMode m) { m_emitMode = m; }
 
     void LoadStrings(const uint8_t* fileData, size_t fileSize,
-                     const IMAGE_NT_HEADERS* nt, uint64_t imageBase) {
+        const IMAGE_NT_HEADERS* nt, uint64_t imageBase) {
         const auto* sec = IMAGE_FIRST_SECTION(nt);
         for (int i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
             const std::string sn(
@@ -1458,7 +1706,8 @@ public:
                 if (c >= 32 && c <= 126) {
                     if (cur.empty()) start = va + j;
                     cur += static_cast<char>(c);
-                } else {
+                }
+                else {
                     if (CompilableEmitter::LooksLikeText(cur)) m_strings[start] = cur;
                     cur.clear();
                 }
@@ -1476,14 +1725,15 @@ public:
                     auto it = m_strings.find(wstart);
                     if (it == m_strings.end() || it->second.size() < wcur.size())
                         m_strings[wstart] = wcur;
-                };
+                    };
                 for (uint32_t j = static_cast<uint32_t>(align);
-                     j + 1 < sec[i].SizeOfRawData; j += 2) {
+                    j + 1 < sec[i].SizeOfRawData; j += 2) {
                     const uint8_t lo = d[j], hi = d[j + 1];
                     if (hi == 0 && lo >= 32 && lo <= 126) {
                         if (wcur.empty()) wstart = va + j;
                         wcur += static_cast<char>(lo);
-                    } else {
+                    }
+                    else {
                         flushWide();
                         wcur.clear();
                     }
@@ -1494,7 +1744,7 @@ public:
     }
 
     void AnalyzeAllFunctions(std::vector<Insn>& allInsns,
-                             uint64_t imageBase, uint64_t entryVA) {
+        uint64_t imageBase, uint64_t entryVA) {
         m_imageBase = imageBase;
         FindFunctions(allInsns, entryVA);
 
@@ -1532,7 +1782,7 @@ public:
                     flow.Run(f);
                     dyn.Analyze(f, m_strings);
                 }
-            });
+                });
         }
         for (auto& t : pool) t.join();
 
@@ -1542,6 +1792,33 @@ public:
 
         CompilableEmitter em;
         TypeRecovery types;
+        // 这些结构库全是内核对象；只有真的导入了内核模式 API 才启用字段标注，
+        // 否则用户态程序（osk/cmd/notepad）的每段 MEM 都会被错标成 _IRP 等。
+        {
+            static const char* const KERNEL_APIS[] = {
+                "IoCreateDevice", "IoDeleteDevice", "IoGetCurrentIrpStackLocation",
+                "PsGetCurrentProcess", "KeInsertQueueDpc", "MmGetSystemRoutineAddress"
+            };
+            bool kernelMode = false;
+            for (const auto& f : m_functions) {
+                if (f.isDead) continue;
+                for (const auto& b : f.blocks) {
+                    for (const auto& s : b.pcode) {
+                        if (s.op != "CALL") continue;
+                        for (const char* k : KERNEL_APIS) {
+                            if (s.src1.find(k) != std::string::npos) {
+                                kernelMode = true;
+                                break;
+                            }
+                        }
+                        if (kernelMode) break;
+                    }
+                    if (kernelMode) break;
+                }
+                if (kernelMode) break;
+            }
+            types.EnableStructNotes(kernelMode);
+        }
         for (auto& f : m_functions) {
             if (f.isDead) continue;
             std::string code = (m_emitMode == EmitMode::Compilable)
@@ -1574,19 +1851,19 @@ public:
         auto hasEntry = [&]() {
             for (const auto& f : m_functions) if (f.name == "entry_point") return true;
             return false;
-        };
+            };
 
         // main 先跑 CRT 启动器，再调用识别出的用户入口（弹窗等），
         // 否则生成程序只做一堆初始化就退出，看不到任何用户代码效果。
         auto emitMain = [&](std::ostream& o) {
             o << "int main(int argc, char** argv) {\n"
-              << "    (void)argc; (void)argv;\n";
+                << "    (void)argc; (void)argv;\n";
             if (hasEntry())
                 o << "    entry_point((uint64_t)argc, (uint64_t)argv, 0, 0);\n";
             if (!m_userEntry.empty())
                 o << "    /* user entry */ " << m_userEntry << "(0, 0, 0, 0);\n";
             o << "    return 0;\n}\n";
-        };
+            };
 
         if (m_emitMode == EmitMode::Compilable) {
             CompilableEmitter em;
@@ -1597,12 +1874,12 @@ public:
                 if (n.empty()) return false;
                 auto ok = [](char c) {
                     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                           (c >= '0' && c <= '9') || c == '_';
-                };
+                        (c >= '0' && c <= '9') || c == '_';
+                    };
                 if (!ok(n[0]) || (n[0] >= '0' && n[0] <= '9')) return false;
                 for (char c : n) if (!ok(c)) return false;
                 return true;
-            };
+                };
 
             // 收集有函数体的函数（定义顺序 = m_functions 顺序）。
             std::set<std::string> definedNames;
@@ -1613,6 +1890,44 @@ public:
                 definedNames.insert(f.name);
                 defOrder[f.name] = ordered.size();
                 ordered.push_back(&f);
+            }
+
+            // 拓扑排序：让被调用者排在调用者之前。原本按地址输出时，调用关系
+            // 几乎总是向前引用，导致每个函数都要一行前向声明（osk.c 达 200+ 行）。
+            // 排序后只剩真实调用环内的少数声明。DFS 后序，遇环（state==1）跳过，
+            // 保证一定能输出全部函数。
+            {
+                const size_t n = ordered.size();
+                std::unordered_map<std::string, size_t> idxByName;
+                for (size_t i = 0; i < n; ++i) idxByName[ordered[i]->name] = i;
+
+                std::vector<std::vector<size_t>> deps(n);
+                for (size_t i = 0; i < n; ++i) {
+                    for (const auto& b : ordered[i]->blocks) {
+                        for (const auto& s : b.pcode) {
+                            if (s.op != "CALL" || s.src1.empty()) continue;
+                            auto it = idxByName.find(s.src1);
+                            if (it != idxByName.end() && it->second != i)
+                                deps[i].push_back(it->second);
+                        }
+                    }
+                }
+
+                std::vector<int> state(n, 0);  // 0=未访问 1=访问中 2=完成
+                std::vector<const Function*> sorted;
+                sorted.reserve(n);
+                std::function<void(size_t)> visit = [&](size_t u) {
+                    if (state[u]) return;
+                    state[u] = 1;
+                    for (size_t v : deps[u]) visit(v);
+                    state[u] = 2;
+                    sorted.push_back(ordered[u]);
+                };
+                for (size_t i = 0; i < n; ++i) visit(i);
+                ordered.swap(sorted);
+                defOrder.clear();
+                for (size_t i = 0; i < ordered.size(); ++i)
+                    defOrder[ordered[i]->name] = i;
             }
 
             // 收集所有直接调用目标（排除 api_/未解析 0/间接表达式）。
@@ -1640,32 +1955,28 @@ public:
                     }
                 }
             }
-            for (const auto& n : needDecl)
-                out << "uint64_t " << n
-                    << "(uint64_t, uint64_t, uint64_t, uint64_t);\n";
-
             // 被调用却没生成函数体的目标（被判 dead / 无有效代码）：补空桩。
-            // 否则调用点会残留 sub_xxx 引用，既无声明也无定义 -> C3861 / 链接失败。
-            // 这些例程本就没有反编译出逻辑，返回 0 的空桩保证生成文件可编译可链接。
+            // 否则调用点会残留 xxx 引用，既无声明也无定义 -> C3861 / 链接失败。
             std::set<std::string> stubs;
             for (const auto& n : called) {
                 if (n == "entry_point" || definedNames.count(n)) continue;
                 stubs.insert(n);
             }
+            // 前向声明与空桩统一用紧凑单行签名（省略未使用的形参名，pragma 已禁 4100）。
+            for (const auto& n : needDecl)
+                out << "uint64_t " << n << "(uint64_t,uint64_t,uint64_t,uint64_t);\n";
             for (const auto& n : stubs)
                 out << "uint64_t " << n
-                       << "(uint64_t a,uint64_t b,uint64_t c,uint64_t d) "
-                       << "{ (void)a;(void)b;(void)c;(void)d; return 0; }\n";
+                << "(uint64_t,uint64_t,uint64_t,uint64_t){ return 0; }\n";
             if (!needDecl.empty() || !stubs.empty()) out << "\n";
 
-            for (const auto& f : m_functions) {
-                if (!f.isDead && !f.generatedCode.empty()) out << f.generatedCode;
-            }
+            // 按拓扑序输出函数体：被调用者在前，调用点无需前向声明。
+            for (const auto* f : ordered) out << f->generatedCode;
             if (!hasEntry())
-                out << "uint64_t entry_point(uint64_t a,uint64_t b,uint64_t c,uint64_t d) "
-                       "{ (void)a;(void)b;(void)c;(void)d; return 0; }\n";
+                out << "uint64_t entry_point(uint64_t,uint64_t,uint64_t,uint64_t) { return 0; }\n";
             emitMain(out);
-        } else {
+        }
+        else {
             out << "\xEF\xBB\xBF#include <stdint.h>\n"
                 << "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
                 << "typedef void* HMODULE;\ntypedef void* FARPROC;\n"
@@ -1694,8 +2005,7 @@ public:
                 if (!f.isDead && !f.generatedCode.empty()) out << f.generatedCode << "\n";
             }
             if (!hasEntry())
-                out << "uint64_t entry_point(uint64_t a,uint64_t b,uint64_t c,uint64_t d) "
-                       "{ (void)a;(void)b;(void)c;(void)d; return 0; }\n";
+                out << "uint64_t entry_point(uint64_t,uint64_t,uint64_t,uint64_t) { return 0; }\n";
             emitMain(out);
         }
     }
@@ -1703,7 +2013,7 @@ public:
     static std::string SafeName(std::string name) {
         for (char& c : name) {
             if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                  (c >= '0' && c <= '9') || c == '_')) c = '_';
+                (c >= '0' && c <= '9') || c == '_')) c = '_';
         }
         if (name.empty() || (name[0] >= '0' && name[0] <= '9')) name = "fn_" + name;
         return name;
@@ -1713,8 +2023,8 @@ public:
         if (n.empty()) return false;
         auto ok = [](char c) {
             return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                   (c >= '0' && c <= '9') || c == '_';
-        };
+                (c >= '0' && c <= '9') || c == '_';
+            };
         if (!ok(n[0]) || (n[0] >= '0' && n[0] <= '9')) return false;
         for (char c : n) if (!ok(c)) return false;
         return true;
@@ -1770,12 +2080,39 @@ public:
         if (best) m_userEntry = best->name;
     }
 
+    // 这些名字若直接用作本地函数名，会与 CRT intrinsic（memcpy/memset 即使不
+    // include 头文件也可能触发 C2169）或系统头文件声明冲突。命中后由 UniqueName
+    // 自动改成 <name>_<addr>，既避开冲突又保留「这是哪个 API 的本地实现」的信息。
+    // 注意：MessageBoxW/CreateWindowExW/socket 等 GUI/网络 API 不在此列——
+    // 本生成器不 include windows.h，它们作为函数名不会冲突，且可读性更好。
+    static bool IsSystemSymbol(const std::string& n) {
+        static const std::set<std::string> S = {
+            // CRT / 编译器内建
+            "malloc","calloc","realloc","free","memcpy","memcpy_s","memmove",
+            "memmove_s","memcmp","memset","strlen","strcpy","strcpy_s","strcat",
+            "strcmp","strncmp","wcslen","wcscpy","wcscpy_s","wcscmp","wcsncmp",
+            "wcschr","wcsrchr","wcscspn","wcsspn","wcsstr","wcstoul","abs","labs",
+            "exit","_exit","abort","qsort","atoi","atol","strtol","strtoul",
+            "printf","sprintf","snprintf","vsprintf","fprintf","puts","fopen",
+            "fclose","fread","fwrite",
+            // 常见 Win32（一旦引入 windows.h 即冲突）
+            "GetLastError","SetLastError","GetModuleHandleW","GetModuleHandleA",
+            "GetModuleFileNameW","GetModuleFileNameA","LoadLibraryW","LoadLibraryExW",
+            "FreeLibrary","GetProcAddress","CloseHandle","CreateFileW","ReadFile",
+            "WriteFile"
+        };
+        return S.count(n) != 0;
+    }
+
     // 避免生成的函数名与 preamble / C/C++ 关键字冲突。
     static bool IsReservedName(const std::string& n) {
         static const std::set<std::string> R = {
             "entry_point", "main", "ResolveApi", "CallIndirect",
             "UnknownInstruction", "API_CALL", "GA", "MEM", "MEM8", "MEM16",
             "MEM32", "MEM64", "generic_pfn_t", "reg64_t",
+            // preamble 中 extern "C" 声明、且 ResolveApi 内部要真实调用的符号。
+            // 若生成同名函数会触发 C2371（签名重定义），并让解析器误调到桩上。
+            "LoadLibraryA", "GetModuleHandleA", "GetProcAddress",
             "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
             "r8","r9","r10","r11","r12","r13","r14","r15",
             "zflag","sflag","cflag","g_mem",
@@ -1790,12 +2127,12 @@ public:
             "this","throw","true","try","typeid","typename","using","virtual",
             "wchar_t"
         };
-        return R.count(n) != 0;
+        return R.count(n) != 0 || IsSystemSymbol(n);
     }
 
     static std::string UniqueName(const std::string& base, uint64_t addr,
-                                  std::unordered_map<std::string, int>& use,
-                                  std::set<std::string>& reserved) {
+        std::unordered_map<std::string, int>& use,
+        std::set<std::string>& reserved) {
         std::string candidate = base;
         if (++use[base] > 1 || IsReservedName(candidate))
             candidate = base + "_" + ToHex(addr);
@@ -1832,7 +2169,7 @@ private:
         const char* p = ZydisRegisterGetString(reg);
         if (!p) return "unknown";
         std::string s(p);
-        if      (s == "ecx") return "rcx";
+        if (s == "ecx") return "rcx";
         else if (s == "edx") return "rdx";
         else if (s == "r8d") return "r8";
         else if (s == "r9d") return "r9";
@@ -1857,7 +2194,8 @@ private:
         if (sec && tim) {
             f.isLibraryFunc = true;
             f.libFuncName = "__security_init_cookie";
-        } else if (rtl) {
+        }
+        else if (rtl) {
             f.isLibraryFunc = true;
             f.libFuncName = "__SEH_Exception_Handler";
         }
@@ -1872,6 +2210,68 @@ private:
         const std::string note = "    // [FLIRT] " + libName + " (identified library routine)\n";
         code.insert(eol + 1, note);
         return code;
+    }
+
+    // 没有任何 API 调用信息时，按函数体特征推断语义名。上一版在这里直接
+    // 生成 sub_<addr>，是整个输出里最刺眼的一类名字。seq 是按地址排序的
+    // 序号，只用于区分同类函数，不再把十六进制地址写进函数名。
+    std::string SemanticBase(const Function& f, size_t seq) const {
+        int calls = 0, memWrites = 0, cmps = 0, cjmps = 0, stmts = 0;
+        std::vector<uint64_t> strAddrs;
+        bool hasLoop = false;
+
+        for (const auto& b : f.blocks) {
+            if (b.isLoopHeader) hasLoop = true;
+            for (const auto& s : b.pcode) {
+                ++stmts;
+                if (s.op == "CALL") ++calls;
+                else if (s.op == "CMP" || s.op == "TEST") ++cmps;
+                else if (s.op == "CJMP") ++cjmps;
+                else if (s.op == "MOV" && s.dst.rfind("MEM(", 0) == 0) ++memWrites;
+
+                auto pickStr = [&](const std::string& x) {
+                    if (x.rfind("STR_", 0) == 0)
+                        strAddrs.push_back(strtoull(x.c_str() + 4, nullptr, 16));
+                };
+                pickStr(s.dst);
+                pickStr(s.src1);
+                pickStr(s.src2);
+            }
+        }
+
+        std::ostringstream no;
+        no << std::setw(3) << std::setfill('0') << (seq % 1000);
+
+        // 1. 引用了已还原的字符串：取开头单词，可读性最好。
+        for (uint64_t a : strAddrs) {
+            auto it = m_strings.find(a);
+            if (it == m_strings.end()) continue;
+            std::string w;
+            for (unsigned char c : it->second) {
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_') {
+                    w += static_cast<char>(tolower(c));
+                    if (w.size() >= 24) break;
+                }
+                // 空格/标点直接跳过，把 "string too long" 合成 stringtoolong。
+            }
+            if (w.size() >= 3 && IsIdentifier(w)) return "str_" + w;
+        }
+
+        // 2. 无调用、成片内存写：结构体/对象初始化例程。
+        if (calls == 0 && memWrites >= 3) return "init_fields_" + no.str();
+
+        // 3. 无调用、纯比较分支：条件检查例程。
+        if (calls == 0 && cmps > 0 && cjmps > 0) return "check_" + no.str();
+
+        // 4. 带循环：遍历/扫描例程。
+        if (hasLoop) return "scan_" + no.str();
+
+        // 5. 极短函数：桩或简单取值器。
+        if (stmts <= 3) return "stub_" + no.str();
+
+        // 6. 兜底：短序号，不含地址。
+        return "fn_" + no.str();
     }
 
     void RenameFunctions() {
@@ -1889,8 +2289,11 @@ private:
             f.name = candidate;
         }
 
-        // 第二轮：普通函数按「实际调用最多的 API」直接命名。
-        // sub_1001000 若是对 socket 的薄封装，就会变成 socket，像人手写的名字。
+        // 第二轮：普通函数按「实际调用最多的 API」直接命名；没有 API 的
+        // 按函数体特征命名，保证输出里不再出现 sub_<addr>。
+        std::unordered_map<uint64_t, size_t> addrSeq;
+        for (size_t i = 0; i < m_functions.size(); ++i)
+            addrSeq[m_functions[i].startAddr] = i + 1;
         for (auto& f : m_functions) {
             if (f.name == "entry_point" || f.isLibraryFunc) continue;
 
@@ -1910,17 +2313,19 @@ private:
                 // 单个 API 直接叫它的名字（socket）；混用多个时才加 _wrapper。
                 if (apiCount.size() > 1) base += "_wrapper";
             }
-            if (base.empty()) base = "sub_" + ToHex(f.startAddr);
+            if (base.empty()) base = SemanticBase(f, addrSeq[f.startAddr]);
 
             const std::string candidate = UniqueName(base, f.startAddr, nameUse, reserved);
             oldToNew[f.name] = candidate;
             f.name = candidate;
         }
 
-        // 第三轮：没有 API 信息、但只转发给一个已命名函数的，命名为 <callee>_thunk。
+        // 第三轮：第二轮落到 fn_<seq> / stub_<seq> 兜底名、且只转发给一个
+        // 已命名函数的，升级为 <callee>_thunk。此时 callee 已有语义名，不带地址。
         for (auto& f : m_functions) {
             if (f.name == "entry_point" || f.isLibraryFunc ||
-                f.name.rfind("sub_", 0) != 0) continue;
+                (f.name.rfind("fn_", 0) != 0 &&
+                 f.name.rfind("stub_", 0) != 0)) continue;
 
             std::string soleCallee;
             int calls = 0;
@@ -1943,11 +2348,17 @@ private:
             }
             // 间接调用目标（如 ((void(*)())MEM(...))）不是合法标识符，不能拿来命名。
             if (hasApiCall || conflict || calls != 1 || soleCallee.empty() ||
-                soleCallee.rfind("sub_", 0) == 0 || !IsIdentifier(soleCallee)) continue;
+                soleCallee.rfind("func_", 0) == 0 ||
+                soleCallee.rfind("fn_", 0) == 0 || !IsIdentifier(soleCallee) ||
+                soleCallee == f.name) continue;
 
             const std::string oldName = f.name;
             const std::string candidate = UniqueName(
                 soleCallee + "_thunk", f.startAddr, nameUse, reserved);
+            // 把所有指向旧名的映射同步到新名，否则第四轮回写调用点时
+            // 会引用已不存在的旧函数（C3861 / 链接失败）。
+            for (auto& kv : oldToNew)
+                if (kv.second == oldName) kv.second = candidate;
             oldToNew[oldName] = candidate;
             f.name = candidate;
         }
@@ -1997,7 +2408,8 @@ private:
                 f.name = "entry_point";
                 f.isDead = false;
                 assigned = true;
-            } else {
+            }
+            else {
                 f.name = "func_" + ToHex(f.startAddr);
             }
             f.blocks.push_back(BasicBlock{});
@@ -2020,7 +2432,7 @@ private:
                     insn.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                     insn.operands[1].reg.value == ZYDIS_REGISTER_AL &&
                     (insn.operands[0].mem.base == ZYDIS_REGISTER_RAX ||
-                     insn.operands[0].mem.base == ZYDIS_REGISTER_NONE) &&
+                        insn.operands[0].mem.base == ZYDIS_REGISTER_NONE) &&
                     insn.operands[0].mem.index == ZYDIS_REGISTER_NONE &&
                     insn.operands[0].mem.disp.value == 0) {
                     ++i;
@@ -2048,7 +2460,7 @@ private:
                             if (!first) r += '+';
                             r += t;
                             first = false;
-                        };
+                            };
 
                         if (op.mem.base == ZYDIS_REGISTER_RIP) {
                             const uint64_t target = insn.addr + insn.instr.length
@@ -2066,22 +2478,23 @@ private:
                             if (first) {
                                 r += d < 0 ? "-" + std::to_string(-d) : std::to_string(d);
                                 first = false;
-                            } else {
-                                r += d < 0 ? "-"+std::to_string(-d) : "+"+std::to_string(d);
+                            }
+                            else {
+                                r += d < 0 ? "-" + std::to_string(-d) : "+" + std::to_string(d);
                             }
                         }
                         r += ')';
                         return r;
                     }
                     return std::string("unknown");
-                };
+                    };
 
                 if (m == "mov" || m == "movzx" || m == "movsxd" || m == "movsx") {
                     s.op = "MOV"; s.dst = GetOp(0); s.src1 = GetOp(1);
                 }
                 else if (m.find("movdqa") != std::string::npos ||
-                         m.find("movdqu") != std::string::npos ||
-                         m.find("movups") != std::string::npos) {
+                    m.find("movdqu") != std::string::npos ||
+                    m.find("movups") != std::string::npos) {
                     s.op = "SIMD_MOV"; s.dst = GetOp(0); s.src1 = GetOp(1);
                 }
                 else if (m == "lea") {
@@ -2092,13 +2505,14 @@ private:
                         const uint64_t tgt = insn.addr + insn.instr.length
                             + static_cast<int64_t>(insn.operands[1].mem.disp.value);
                         s.src1 = "STR_" + ToHex(tgt);
-                    } else {
+                    }
+                    else {
                         s.src1 = GetOp(1);
                     }
                 }
                 else if (m == "add" || m == "sub" || m == "xor" || m == "and" ||
-                         m == "or"  || m == "shl" || m == "shr" || m == "sar" ||
-                         m == "pxor" || m == "pand" || m == "por") {
+                    m == "or" || m == "shl" || m == "shr" || m == "sar" ||
+                    m == "pxor" || m == "pand" || m == "por") {
                     s.op = "ALU"; s.dst = GetOp(0); s.src1 = m; s.src2 = GetOp(1);
                 }
                 else if (m == "inc" || m == "dec" || m == "neg" || m == "not") {
@@ -2126,15 +2540,17 @@ private:
                     s.op = "CALL";
                     if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
                         s.src1 = "func_" + ToHex(ImmediateTarget(insn, insn.operands[0]));
-                    } else if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                               insn.operands[0].mem.base == ZYDIS_REGISTER_RIP) {
+                    }
+                    else if (insn.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                        insn.operands[0].mem.base == ZYDIS_REGISTER_RIP) {
                         const uint64_t tgt = insn.addr + insn.instr.length
                             + static_cast<int64_t>(insn.operands[0].mem.disp.value);
                         const std::string api = m_apiResolver->GetApiName(tgt);
                         s.src1 = api.empty()
                             ? "MEM(0x" + ToHex(tgt) + ")"
                             : "api_" + api;
-                    } else {
+                    }
+                    else {
                         s.src1 = GetOp(0);
                     }
                 }
@@ -2148,11 +2564,13 @@ private:
                         if (!api.empty()) {
                             s.op = "CALL";
                             s.src1 = "api_" + api;
-                        } else {
+                        }
+                        else {
                             s.op = "JMP";
                             s.jumpTarget = 0;
                         }
-                    } else {
+                    }
+                    else {
                         s.op = "JMP";
                         if (op0.type == ZYDIS_OPERAND_TYPE_IMMEDIATE)
                             s.jumpTarget = ImmediateTarget(insn, op0);
@@ -2197,9 +2615,12 @@ private:
     // Analysis 模式：阅读用伪代码输出
     std::string EmitFunction(const Function& func) const {
         std::stringstream ss;
+        const auto pn = ParamNames(func.name);
         ss << "uint64_t " << func.name
-           << "(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4) {\n"
-           << "    (void)a1;(void)a2;(void)a3;(void)a4;\n";
+            << "(uint64_t " << pn[0] << ", uint64_t " << pn[1]
+            << ", uint64_t " << pn[2] << ", uint64_t " << pn[3] << ") {\n"
+            << "    (void)" << pn[0] << ";(void)" << pn[1]
+            << ";(void)" << pn[2] << ";(void)" << pn[3] << ";\n";
 
         std::set<uint64_t> jumps;
         for (const auto& b : func.blocks)
@@ -2213,12 +2634,13 @@ private:
         auto Emit = [&](const std::string& l) {
             if (l == lastLine) {
                 if (++dup >= 3) return;
-            } else {
+            }
+            else {
                 dup = 0;
                 lastLine = l;
             }
             ss << l;
-        };
+            };
 
         std::map<std::string, std::string> rc;
         for (const auto& b : func.blocks) {
@@ -2253,14 +2675,14 @@ private:
                     break;
                 }
                 case 'A': { // ALU
-                    if      (s.src1 == "inc") Emit("    " + s.dst + "++;\n");
+                    if (s.src1 == "inc") Emit("    " + s.dst + "++;\n");
                     else if (s.src1 == "dec") Emit("    " + s.dst + "--;\n");
                     else {
                         std::string o = "+";
-                        if      (s.src1 == "sub") o = "-";
+                        if (s.src1 == "sub") o = "-";
                         else if (s.src1 == "xor" || s.src1 == "pxor") o = "^";
                         else if (s.src1 == "and" || s.src1 == "pand") o = "&";
-                        else if (s.src1 == "or"  || s.src1 == "por")  o = "|";
+                        else if (s.src1 == "or" || s.src1 == "por")  o = "|";
                         Emit("    " + s.dst + " " + o + "= " + s.src2 + ";\n");
                     }
                     hasCode = true;
@@ -2270,13 +2692,14 @@ private:
                     if (s.op == "CALL") {
                         if (s.src1.rfind("api_", 0) == 0) {
                             Emit("    ResolveApi(\"" + s.src1.substr(4) + "\");\n");
-                        } else {
+                        }
+                        else {
                             std::string a1 = rc.count("rcx") ? rc["rcx"] : "0";
                             std::string a2 = rc.count("rdx") ? rc["rdx"] : "0";
-                            std::string a3 = rc.count("r8")  ? rc["r8"]  : "0";
-                            std::string a4 = rc.count("r9")  ? rc["r9"]  : "0";
+                            std::string a3 = rc.count("r8") ? rc["r8"] : "0";
+                            std::string a4 = rc.count("r9") ? rc["r9"] : "0";
                             Emit("    " + s.src1 + "(" + a1 + ", " + a2 + ", "
-                                 + a3 + ", " + a4 + ");\n");
+                                + a3 + ", " + a4 + ");\n");
                             rc.clear();
                         }
                         hasCode = true;
@@ -2317,7 +2740,7 @@ int main(int argc, char* argv[]) {
             << "  --emit <mode>   analysis or compilable (default: compilable)\n"
             << "  -h, -help, --help\n"
             << "                  Show this help message\n";
-    };
+        };
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -2373,7 +2796,8 @@ int main(int argc, char* argv[]) {
             ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
         imageBase = o->ImageBase;
         entry = imageBase + o->AddressOfEntryPoint;
-    } else {
+    }
+    else {
         const auto* o = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(
             ntBase + 4 + sizeof(IMAGE_FILE_HEADER));
         imageBase = o->ImageBase;
@@ -2389,7 +2813,7 @@ int main(int argc, char* argv[]) {
     const IMAGE_SECTION_HEADER* target = nullptr;
     for (int i = 0; i < fh->NumberOfSections; ++i) {
         if (sec[i].SizeOfRawData > 0 && strncmp(
-                reinterpret_cast<const char*>(sec[i].Name), ".text", 5) == 0) {
+            reinterpret_cast<const char*>(sec[i].Name), ".text", 5) == 0) {
             target = &sec[i];
             break;
         }
@@ -2419,7 +2843,8 @@ int main(int argc, char* argv[]) {
     ZydisDecoder dec;
     if (is64) {
         ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-    } else {
+    }
+    else {
         ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32);
     }
 
@@ -2429,11 +2854,12 @@ int main(int argc, char* argv[]) {
     while (off < codeSz) {
         Insn ins;
         if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&dec, code + off, codeSz - off,
-                                                &ins.instr, ins.operands))) {
+            &ins.instr, ins.operands))) {
             ins.addr = vbase + off;
             all.push_back(ins);
             off += ins.instr.length;
-        } else {
+        }
+        else {
             ++off;
         }
     }
