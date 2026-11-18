@@ -1514,8 +1514,8 @@ public:
             }
             for (const auto& n : stubs)
                 out << "uint64_t " << n
-                       "(uint64_t a,uint64_t b,uint64_t c,uint64_t d) "
-                       "{ (void)a;(void)b;(void)c;(void)d; return 0; }\n";
+                       << "(uint64_t a,uint64_t b,uint64_t c,uint64_t d) "
+                       << "{ (void)a;(void)b;(void)c;(void)d; return 0; }\n";
             if (!needDecl.empty() || !stubs.empty()) out << "\n";
 
             for (const auto& f : m_functions) {
