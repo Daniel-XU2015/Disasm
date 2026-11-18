@@ -702,7 +702,7 @@ static inline void TESTF(uint64_t a, uint64_t b) {
             ctx.EmitAll();
         }
 
-        std::string body = ss.str();
+        std::string body = StripSpinLoops(ss.str());
         ss.str(""); ss.clear();
 
         // 精简返回值：若函数体最后一行是 `rax.q = EXPR;`，其后立即函数结束，
@@ -1084,6 +1084,118 @@ private:
     };
 
 public:
+    // 判断一段候选字节是否"像文本"。原先最小长度只有 2，导致二进制里的
+    // 反引号/单引号之类被存成字符串（生成奇怪的乱码字面量）。
+    // 现在要求 >=4 字符且至少一半是字母/数字/常见标点，过滤掉这类噪声。
+    static bool LooksLikeText(const std::string& s) {
+        if (s.size() < 4 || s.size() > 512) return false;
+        size_t good = 0;
+        for (unsigned char c : s) {
+            const bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                               (c >= '0' && c <= '9');
+            const bool punct = (c == ' ' || c == '.' || c == '\\' || c == '/' ||
+                                c == ':' || c == '-' || c == '_' || c == ',' ||
+                                c == '!' || c == '?' || c == '\'' || c == '%' ||
+                                c == '(' || c == ')' || c == '[' || c == ']');
+            if (alnum || punct) ++good;
+        }
+        return good * 2 >= s.size();
+    }
+
+    // 判断循环体是否"空转"：只有对寄存器的简单赋值 / 注释 / 空行，
+    // 没有函数调用、内存写、条件控制或标志计算。这类 while 的条件标志
+    // 通常从未被 CMP/TEST 设置（全局 zflag 初始为 0），运行必然挂死，
+    // 是反编译残留，可以安全折叠。
+    static bool IsSpinBody(const std::string& body) {
+        // 出现括号即认为有调用/复杂表达式，保守放过。
+        if (body.find('(') != std::string::npos) return false;
+        if (body.find("if ") != std::string::npos ||
+            body.find("if(") != std::string::npos ||
+            body.find("break") != std::string::npos ||
+            body.find("continue") != std::string::npos ||
+            body.find("return") != std::string::npos ||
+            body.find("while") != std::string::npos ||
+            body.find("goto") != std::string::npos ||
+            body.find("CMP(") != std::string::npos ||
+            body.find("TESTF(") != std::string::npos) return false;
+        std::istringstream in(body);
+        std::string line;
+        int assigns = 0;
+        while (std::getline(in, line)) {
+            std::string t;
+            for (unsigned char c : line)
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+                    t += static_cast<char>(c);
+            if (t.empty()) continue;
+            if (t.rfind("//", 0) == 0 || t.rfind("/*", 0) == 0) continue;
+            if (t.empty() || t.back() != ';') return false;
+            const size_t eq = t.find('=');
+            if (eq == std::string::npos || t.find('=', eq + 1) != std::string::npos)
+                return false;  // 单个 =；排除 == / != / <= / >=
+            const std::string lhs = t.substr(0, eq);
+            if (lhs.empty() || lhs[0] != 'r') return false;  // 寄存器左值
+            for (size_t k = 0; k < lhs.size(); ++k) {
+                const char c = lhs[k];
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                      c == '.' || c == '_')) return false;
+            }
+            const std::string rhs = t.substr(eq + 1, t.size() - eq - 2);
+            if (rhs.empty() || rhs.size() > 40) return false;
+            for (size_t k = 0; k < rhs.size(); ++k) {
+                const char c = rhs[k];
+                if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                      (c >= '0' && c <= '9') || c == '.' || c == 'x' ||
+                      c == 'X' || c == 'U' || c == 'L' || c == '-')) return false;
+            }
+            if (++assigns > 2) return false;
+        }
+        return assigns > 0;
+    }
+
+    // 后处理：折叠上述空转 while 循环，保留其中的赋值（等价于循环至少
+    // 执行一次后的结果），避免出现 while(!zflag){rax.q=0;} 这种挂死残留。
+    static std::string StripSpinLoops(const std::string& src) {
+        std::vector<std::string> lines;
+        std::istringstream in(src);
+        std::string ln;
+        while (std::getline(in, ln)) lines.push_back(ln);
+        std::ostringstream out;
+        for (size_t i = 0; i < lines.size(); ++i) {
+            const std::string& l = lines[i];
+            size_t pos = l.find("while (");
+            if (pos == std::string::npos) pos = l.find("while(");
+            if (pos == std::string::npos || l.find('{') == std::string::npos) {
+                out << l << "\n";
+                continue;
+            }
+            int depth = 0;
+            size_t close = lines.size();
+            for (size_t j = i; j < lines.size(); ++j) {
+                for (char c : lines[j]) {
+                    if (c == '{') ++depth;
+                    else if (c == '}') {
+                        if (--depth == 0) { close = j; break; }
+                    }
+                }
+                if (close != lines.size()) break;
+            }
+            if (close == lines.size()) { out << l << "\n"; continue; }
+            std::string body;
+            for (size_t k = i + 1; k < close; ++k) body += lines[k] + "\n";
+            if (IsSpinBody(body)) {
+                out << "    /* [empty loop removed] */\n";
+                for (size_t k = i + 1; k < close; ++k) {
+                    const std::string& bl = lines[k];
+                    out << (bl.size() >= 4 ? bl.substr(4) : bl) << "\n";
+                }
+                i = close;  // 跳过整个循环
+            } else {
+                out << l << "\n";  // 循环体各行照常输出
+            }
+        }
+        return out.str();
+    }
+
     // 把原始字节串转成 C 字符串字面量的内容（处理转义与非打印字符）。
     static std::string CEscape(const std::string& s) {
         std::string o;
@@ -1336,19 +1448,47 @@ public:
 
             const uint8_t* d = fileData + sec[i].PointerToRawData;
             const uint64_t va = imageBase + sec[i].VirtualAddress;
+
+            // 1) ASCII/ANSI 字符串：连续可打印字节，遇非可打印字节收尾。
+            //    用 LooksLikeText 过滤短噪声，避免误存成反引号之类乱码。
             std::string cur;
             uint64_t start = 0;
             for (uint32_t j = 0; j < sec[i].SizeOfRawData; ++j) {
-                const char c = static_cast<char>(d[j]);
+                const uint8_t c = d[j];
                 if (c >= 32 && c <= 126) {
                     if (cur.empty()) start = va + j;
-                    cur += c;
-                } else if (c == 0) {
-                    if (cur.size() >= 2) m_strings[start] = cur;
-                    cur.clear();
+                    cur += static_cast<char>(c);
                 } else {
+                    if (CompilableEmitter::LooksLikeText(cur)) m_strings[start] = cur;
                     cur.clear();
                 }
+            }
+            if (CompilableEmitter::LooksLikeText(cur)) m_strings[start] = cur;
+
+            // 2) UTF-16LE 宽字符串：可打印 ASCII 后跟 0x00，以 0x00 0x00 结束。
+            //    UWP/WinUI 程序几乎只用宽字符串，旧扫描器遇到宽字符的高字节 0x00
+            //    就清空缓冲，导致这些字符串全部丢失。按两种字节对齐各扫一遍。
+            for (int align = 0; align < 2; ++align) {
+                std::string wcur;
+                uint64_t wstart = 0;
+                auto flushWide = [&]() {
+                    if (!CompilableEmitter::LooksLikeText(wcur)) return;
+                    auto it = m_strings.find(wstart);
+                    if (it == m_strings.end() || it->second.size() < wcur.size())
+                        m_strings[wstart] = wcur;
+                };
+                for (uint32_t j = static_cast<uint32_t>(align);
+                     j + 1 < sec[i].SizeOfRawData; j += 2) {
+                    const uint8_t lo = d[j], hi = d[j + 1];
+                    if (hi == 0 && lo >= 32 && lo <= 126) {
+                        if (wcur.empty()) wstart = va + j;
+                        wcur += static_cast<char>(lo);
+                    } else {
+                        flushWide();
+                        wcur.clear();
+                    }
+                }
+                flushWide();
             }
         }
     }
