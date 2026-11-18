@@ -151,12 +151,13 @@ namespace {
                     while (j < seg.size()) {
                         const unsigned char d = static_cast<unsigned char>(seg[j]);
                         if (!((d >= 'a' && d <= 'z') || (d >= 'A' && d <= 'Z') ||
-                              (d >= '0' && d <= '9') || d == '_')) break;
+                            (d >= '0' && d <= '9') || d == '_')) break;
                         ++j;
                     }
                     ids.push_back(seg.substr(i, j - i));
                     i = j;
-                } else ++i;
+                }
+                else ++i;
             }
             if (ids.size() < 2) continue;
             const std::string ident = ids.back();
@@ -180,7 +181,7 @@ namespace {
             for (char c : tail)
                 if (!isxdigit(static_cast<unsigned char>(c))) { numeric = false; break; }
             if (!(numeric || tail == "wrapper" || tail == "thunk" ||
-                  tail == "wrapper_thunk")) break;
+                tail == "wrapper_thunk")) break;
             base.resize(u);
         }
         const char* sig = ApiSignature(base);
@@ -779,7 +780,7 @@ static inline void TESTF(uint64_t a, uint64_t b) {
             }
             if (!meaningful)
                 return "uint64_t " + func.name +
-                    "(uint64_t,uint64_t,uint64_t,uint64_t) { return 0; }\n\n";
+                "(uint64_t,uint64_t,uint64_t,uint64_t) { return 0; }\n\n";
         }
 
         ss << "uint64_t " << func.name
@@ -845,7 +846,7 @@ private:
             const char n = (i + 1 < line.size()) ? line[i + 1] : '\0';
             switch (st) {
             case CODE:
-                if      (c == '/' && n == '/') { st = LINE_COMMENT; ++i; }
+                if (c == '/' && n == '/') { st = LINE_COMMENT; ++i; }
                 else if (c == '/' && n == '*') { st = BLOCK_COMMENT; ++i; }
                 else if (c == '"')             st = STR;
                 else if (c == '\'')            st = CHR;
@@ -872,8 +873,11 @@ private:
 
     // 自适应缩进：各 emitter 硬编码 4 空格，且 if/else 分支先写进独立缓冲区
     // 再嵌入，嵌套时缩进不会累加，深层代码挤成一团。这里按大括号深度统一
-    // 重排整个函数体（baseIndent=1，函数体内缩一层）。goto 标签顶格显示。
-    static std::string Reindent(const std::string& src, int baseIndent = 1) {
+    // 重排整个函数体。签名行 depth=0 顶格、函数体 depth=1 缩进一层，与 FLIRT
+    // 注释（4 空格）和 main（顶格）保持一致。baseIndent 必须为 0：否则签名行
+    // 与函数体整体右移一层，后续按 4 空格前缀做的 return 折叠/补全会全部失效，
+    // 导致每个函数末尾出现重复的 `return rax.q;`。goto 标签顶格显示。
+    static std::string Reindent(const std::string& src, int baseIndent = 0) {
         std::string out;
         out.reserve(src.size() + src.size() / 8 + 64);
         int depth = 0;
@@ -1339,7 +1343,7 @@ public:
     // 条件恒真、break 位于循环体末尾，语义等价于把循环体顺序执行一遍，
     // 去掉 while 壳与 break 不改变结果，可清掉反编译残留的一次性循环。
     static bool IsOneShotLoop(const std::string& header, const std::string& body,
-                              std::string& flat) {
+        std::string& flat) {
         const size_t brace = header.find('{');
         const std::string h = brace == std::string::npos ? header : header.substr(0, brace);
         std::string t;
@@ -1922,7 +1926,7 @@ public:
                     for (size_t v : deps[u]) visit(v);
                     state[u] = 2;
                     sorted.push_back(ordered[u]);
-                };
+                    };
                 for (size_t i = 0; i < n; ++i) visit(i);
                 ordered.swap(sorted);
                 defOrder.clear();
@@ -2232,7 +2236,7 @@ private:
                 auto pickStr = [&](const std::string& x) {
                     if (x.rfind("STR_", 0) == 0)
                         strAddrs.push_back(strtoull(x.c_str() + 4, nullptr, 16));
-                };
+                    };
                 pickStr(s.dst);
                 pickStr(s.src1);
                 pickStr(s.src2);
@@ -2325,7 +2329,7 @@ private:
         for (auto& f : m_functions) {
             if (f.name == "entry_point" || f.isLibraryFunc ||
                 (f.name.rfind("fn_", 0) != 0 &&
-                 f.name.rfind("stub_", 0) != 0)) continue;
+                    f.name.rfind("stub_", 0) != 0)) continue;
 
             std::string soleCallee;
             int calls = 0;
