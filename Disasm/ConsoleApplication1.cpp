@@ -1580,23 +1580,54 @@ public:
         return true;
     }
 
-    // 找到直接调用 MessageBox 类 API 的用户函数，作为生成 main 的入口。
-    // 这样 main 不再只跑 CRT 启动器，而是能真正执行到弹窗代码。
+    // GUI / WinRT 应用的"主逻辑"API 权重：UWP/WinUI 不靠 MessageBox 弹窗，
+    // 而是通过 WinRT 激活 + 窗口/消息循环驱动，给这些 API 更高的入口权重。
+    static int ApiEntryWeight(const std::string& api) {
+        // WinRT / XAML 应用激活（UWP notepad 的实际路径）
+        if (api.rfind("RoGetActivationFactory", 0) == 0 ||
+            api.rfind("RoActivateInstance", 0) == 0 ||
+            api.rfind("WindowsCreateStringReference", 0) == 0 ||
+            api.rfind("WindowsCreateString", 0) == 0) return 8;
+        // Win32 GUI 窗口创建 / 消息循环（传统 GUI 主逻辑标志）
+        if (api.rfind("CreateWindowEx", 0) == 0 ||
+            api.rfind("RegisterClass", 0) == 0 ||
+            api.rfind("GetMessage", 0) == 0 ||
+            api.rfind("DispatchMessage", 0) == 0 ||
+            api.rfind("TranslateMessage", 0) == 0) return 6;
+        // 对话框 / 弹窗（旧逻辑保留）
+        if (api.rfind("MessageBox", 0) == 0 ||
+            api.rfind("DialogBox", 0) == 0 ||
+            api.rfind("CreateDialog", 0) == 0) return 6;
+        // 其它 WinRT/COM 初始化
+        if (api.rfind("RoInitialize", 0) == 0 ||
+            api.rfind("CoInitialize", 0) == 0) return 3;
+        return 0;
+    }
+
+    // 选出最像"用户主逻辑"的函数作为生成 main 的入口。
+    // 打分依据：调用的高权重 GUI/WinRT API + API 调用总量；库函数、
+    // thunk、空函数不参与。这样 UWP/GUI 程序也能定位到入口，而非空跑。
     void DetectUserEntry() {
         m_userEntry.clear();
+        const Function* best = nullptr;
+        int bestScore = 0;
         for (const auto& f : m_functions) {
             if (f.isDead || f.isLibraryFunc || f.name == "entry_point") continue;
+            if (f.name.find("_thunk") != std::string::npos) continue;  // 转发桩不是主逻辑
+            int score = 0, apiCalls = 0;
             for (const auto& b : f.blocks) {
                 for (const auto& s : b.pcode) {
-                    if (s.op == "CALL" &&
-                        (s.src1.rfind("api_MessageBox", 0) == 0 ||
-                         s.src1.rfind("api_DialogBox", 0) == 0)) {
-                        m_userEntry = f.name;
-                        return;
-                    }
+                    if (s.op != "CALL" || s.src1.rfind("api_", 0) != 0) continue;
+                    ++apiCalls;
+                    score += ApiEntryWeight(s.src1.substr(4));
                 }
             }
+            // 至少几个 API 调用且命中高权重 API，避免选中零碎小函数。
+            if (apiCalls < 3 || score <= 0) continue;
+            score += std::min(apiCalls, 50);  // 规模作次级权重
+            if (score > bestScore) { bestScore = score; best = &f; }
         }
+        if (best) m_userEntry = best->name;
     }
 
     // 避免生成的函数名与 preamble / C/C++ 关键字冲突。
